@@ -29,6 +29,7 @@ def get_db():
 def init_db():
     with app.app_context():
         db = get_db()
+        # Таблица пользователей
         db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +42,7 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Таблица постов
         db.execute('''
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,10 +52,12 @@ def init_db():
                 post_type TEXT DEFAULT 'volunteer',
                 location TEXT,
                 event_date TEXT,
+                needs_volunteers BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
+        # Таблица чатов
         db.execute('''
             CREATE TABLE IF NOT EXISTS chats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +69,7 @@ def init_db():
                 UNIQUE(user1_id, user2_id)
             )
         ''')
+        # Таблица сообщений
         db.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +80,24 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (chat_id) REFERENCES chats (id),
                 FOREIGN KEY (sender_id) REFERENCES users (id)
+            )
+        ''')
+        # Таблица анкет волонтеров
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS volunteer_forms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                contact_info TEXT NOT NULL,
+                age INTEGER NOT NULL,
+                experience TEXT NOT NULL,
+                comment TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (post_id) REFERENCES posts (id),
+                FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
         db.commit()
@@ -197,7 +220,18 @@ def profile():
     db = get_db()
     user = db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
     user_posts = db.execute('SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC', (session['user_id'],)).fetchall()
-    return render_template('profile.html', user=user, posts=user_posts)
+    
+    # Получаем анкеты пользователя
+    user_forms = db.execute('''
+        SELECT vf.*, p.title as post_title, u.username as author_username 
+        FROM volunteer_forms vf 
+        JOIN posts p ON vf.post_id = p.id 
+        JOIN users u ON p.user_id = u.id 
+        WHERE vf.user_id = ? 
+        ORDER BY vf.created_at DESC
+    ''', (session['user_id'],)).fetchall()
+    
+    return render_template('profile.html', user=user, posts=user_posts, forms=user_forms)
 
 @app.route('/profile/edit', methods=['GET', 'POST'])
 @login_required
@@ -256,6 +290,7 @@ def create_post():
         post_type = request.form['post_type']
         location = request.form.get('location', '')
         event_date = request.form.get('event_date', '')
+        needs_volunteers = 'needs_volunteers' in request.form
         
         if not title or not content:
             flash('Заголовок и содержание обязательны')
@@ -263,14 +298,165 @@ def create_post():
         
         db = get_db()
         db.execute(
-            'INSERT INTO posts (user_id, title, content, post_type, location, event_date) VALUES (?, ?, ?, ?, ?, ?)',
-            (session['user_id'], title, content, post_type, location, event_date)
+            'INSERT INTO posts (user_id, title, content, post_type, location, event_date, needs_volunteers) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (session['user_id'], title, content, post_type, location, event_date, needs_volunteers)
         )
         db.commit()
         flash('Пост успешно создан!')
         return redirect(url_for('feed'))
     
     return render_template('create_post.html')
+
+@app.route('/post/<int:post_id>')
+@login_required
+def post_detail(post_id):
+    db = get_db()
+    post = db.execute('''
+        SELECT p.*, u.username, u.full_name 
+        FROM posts p 
+        JOIN users u ON p.user_id = u.id 
+        WHERE p.id = ?
+    ''', (post_id,)).fetchone()
+    
+    if post is None:
+        flash('Пост не найден')
+        return redirect(url_for('feed'))
+    
+    # Проверяем, подавал ли пользователь уже анкету на этот пост
+    existing_form = db.execute(
+        'SELECT * FROM volunteer_forms WHERE post_id = ? AND user_id = ?',
+        (post_id, session['user_id'])
+    ).fetchone()
+    
+    # Для автора поста - показываем список анкет
+    volunteer_forms = None
+    if post['user_id'] == session['user_id']:
+        volunteer_forms = db.execute('''
+            SELECT vf.*, u.username, u.full_name 
+            FROM volunteer_forms vf 
+            JOIN users u ON vf.user_id = u.id 
+            WHERE vf.post_id = ? 
+            ORDER BY vf.created_at DESC
+        ''', (post_id,)).fetchall()
+    
+    return render_template('post_detail.html', 
+                         post=post, 
+                         existing_form=existing_form,
+                         volunteer_forms=volunteer_forms)
+
+@app.route('/post/<int:post_id>/volunteer', methods=['GET', 'POST'])
+@login_required
+def volunteer_for_post(post_id):
+    db = get_db()
+    post = db.execute('SELECT * FROM posts WHERE id = ?', (post_id,)).fetchone()
+    
+    if post is None:
+        flash('Пост не найден')
+        return redirect(url_for('feed'))
+    
+    # Проверяем, не подавал ли пользователь уже анкету
+    existing_form = db.execute(
+        'SELECT * FROM volunteer_forms WHERE post_id = ? AND user_id = ?',
+        (post_id, session['user_id'])
+    ).fetchone()
+    
+    if existing_form:
+        flash('Вы уже подали анкету на это мероприятие')
+        return redirect(url_for('post_detail', post_id=post_id))
+    
+    if request.method == 'POST':
+        full_name = request.form['full_name']
+        username = request.form['username']
+        contact_info = request.form['contact_info']
+        age = request.form['age']
+        experience = request.form['experience']
+        comment = request.form.get('comment', '')
+        
+        if not all([full_name, username, contact_info, age, experience]):
+            flash('Все обязательные поля должны быть заполнены')
+            return redirect(url_for('volunteer_for_post', post_id=post_id))
+        
+        # Сохраняем анкету
+        db.execute(
+            'INSERT INTO volunteer_forms (post_id, user_id, full_name, username, contact_info, age, experience, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (post_id, session['user_id'], full_name, username, contact_info, age, experience, comment)
+        )
+        db.commit()
+        
+        # Создаем чат с автором поста (если еще нет)
+        chat = get_or_create_chat(session['user_id'], post['user_id'])
+        
+        # Отправляем уведомление в чат
+        notification_message = f'''🎯 Новая заявка на мероприятие "{post['title']}"
+
+👤 Волонтер: {full_name} (@{username})
+📞 Контакты: {contact_info}
+🎂 Возраст: {age} лет
+💼 Опыт: {experience}
+💬 Комментарий: {comment or "нет комментария"}
+
+Статус: ⏳ Ожидает рассмотрения'''
+
+        db.execute(
+            'INSERT INTO messages (chat_id, sender_id, message_text) VALUES (?, ?, ?)',
+            (chat['id'], session['user_id'], notification_message)
+        )
+        db.commit()
+        
+        flash('Ваша анкета успешно отправлена! Организатор свяжется с вами.')
+        return redirect(url_for('post_detail', post_id=post_id))
+    
+    return render_template('volunteer_form.html', post=post)
+
+@app.route('/volunteer_form/<int:form_id>/update_status', methods=['POST'])
+@login_required
+def update_form_status(form_id):
+    db = get_db()
+    form = db.execute('''
+        SELECT vf.*, p.user_id as post_author_id, p.title as post_title 
+        FROM volunteer_forms vf 
+        JOIN posts p ON vf.post_id = p.id 
+        WHERE vf.id = ?
+    ''', (form_id,)).fetchone()
+    
+    if form is None:
+        flash('Анкета не найдена')
+        return redirect(url_for('profile'))
+    
+    # Проверяем, что текущий пользователь - автор поста
+    if form['post_author_id'] != session['user_id']:
+        flash('У вас нет прав для изменения этой анкеты')
+        return redirect(url_for('profile'))
+    
+    new_status = request.form['status']
+    
+    # Обновляем статус
+    db.execute(
+        'UPDATE volunteer_forms SET status = ? WHERE id = ?',
+        (new_status, form_id)
+    )
+    
+    # Отправляем уведомление в чат
+    chat = get_or_create_chat(session['user_id'], form['user_id'])
+    
+    status_text = {
+        'approved': '✅ Одобрена',
+        'rejected': '❌ Отклонена',
+        'pending': '⏳ На рассмотрении'
+    }
+    
+    notification_message = f'''📢 Обновление статуса заявки на "{form['post_title']}"
+
+Статус изменен на: {status_text.get(new_status, new_status)}'''
+
+    db.execute(
+        'INSERT INTO messages (chat_id, sender_id, message_text) VALUES (?, ?, ?)',
+        (chat['id'], session['user_id'], notification_message)
+    )
+    db.commit()
+    
+    flash('Статус анкеты обновлен')
+    return redirect(url_for('post_detail', post_id=form['post_id']))
 
 @app.route('/post/<int:post_id>/delete', methods=['POST'])
 @login_required
@@ -501,7 +687,10 @@ def render_template(template_name, **context):
                     {% for post in posts %}
                     <div class="card mb-3">
                         <div class="card-body">
-                            <h5 class="card-title">{{ post.title }}</h5>
+                            <h5 class="card-title">
+                                {{ post.title }}
+                                {% if post.needs_volunteers %}<span class="badge bg-success ms-2">Ищет волонтеров</span>{% endif %}
+                            </h5>
                             <h6 class="card-subtitle mb-2 text-muted">Автор: {{ post.full_name or post.username }}
                                 {% if post.post_type == 'volunteer' %}<span class="badge bg-success">Ищу волонтеров</span>
                                 {% elif post.post_type == 'help' %}<span class="badge bg-warning">Нужна помощь</span>
@@ -511,12 +700,16 @@ def render_template(template_name, **context):
                             {% if post.location %}<p class="card-text"><small>Место: {{ post.location }}</small></p>{% endif %}
                             {% if post.event_date %}<p class="card-text"><small>Дата: {{ post.event_date }}</small></p>{% endif %}
                             <p class="card-text"><small class="text-muted">Опубликовано: {{ post.created_at }}</small></p>
-                            {% if post.user_id == session['user_id'] %}
-                            <form action="/post/{{ post.id }}/delete" method="POST" class="d-inline">
-                                <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить</button>
-                            </form>
-                            {% endif %}
-                            <a href="/chat/{{ post.user_id }}" class="btn btn-primary btn-sm">Написать автору</a>
+                            
+                            <div class="btn-group">
+                                <a href="/post/{{ post.id }}" class="btn btn-outline-primary btn-sm">Подробнее</a>
+                                {% if post.user_id == session['user_id'] %}
+                                <form action="/post/{{ post.id }}/delete" method="POST" class="d-inline">
+                                    <button type="submit" class="btn btn-outline-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить</button>
+                                </form>
+                                {% endif %}
+                                <a href="/chat/{{ post.user_id }}" class="btn btn-outline-success btn-sm">Написать автору</a>
+                            </div>
                         </div>
                     </div>
                     {% else %}<div class="alert alert-info">Пока нет постов. Будьте первым!</div>{% endfor %}
@@ -549,9 +742,200 @@ def render_template(template_name, **context):
                         <div class="mb-3"><label class="form-label">Содержание *</label><textarea class="form-control" name="content" rows="5" required></textarea></div>
                         <div class="mb-3"><label class="form-label">Место проведения</label><input type="text" class="form-control" name="location"></div>
                         <div class="mb-3"><label class="form-label">Дата события</label><input type="datetime-local" class="form-control" name="event_date"></div>
+                        <div class="mb-3 form-check">
+                            <input type="checkbox" class="form-check-input" name="needs_volunteers" id="needs_volunteers">
+                            <label class="form-check-label" for="needs_volunteers">Ищу волонтеров для этого мероприятия</label>
+                        </div>
                         <button type="submit" class="btn btn-primary">Опубликовать</button>
                         <a href="/feed" class="btn btn-secondary">Отмена</a>
                     </form>
+                </div>
+            </body>
+            </html>
+        ''',
+        'post_detail.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>{{ post.title }} - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    {% with messages = get_flashed_messages() %}{% if messages %}{% for message in messages %}<div class="alert alert-success">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}
+                    
+                    <div class="card mb-4">
+                        <div class="card-body">
+                            <h2 class="card-title">{{ post.title }}</h2>
+                            <h6 class="card-subtitle mb-2 text-muted">Автор: {{ post.full_name or post.username }}
+                                {% if post.needs_volunteers %}<span class="badge bg-success ms-2">Ищет волонтеров</span>{% endif %}
+                            </h6>
+                            <p class="card-text">{{ post.content }}</p>
+                            {% if post.location %}<p class="card-text"><strong>Место:</strong> {{ post.location }}</p>{% endif %}
+                            {% if post.event_date %}<p class="card-text"><strong>Дата:</strong> {{ post.event_date }}</p>{% endif %}
+                            <p class="card-text"><small class="text-muted">Опубликовано: {{ post.created_at }}</small></p>
+                        </div>
+                    </div>
+
+                    {% if post.needs_volunteers %}
+                        {% if post.user_id != session['user_id'] %}
+                            {% if not existing_form %}
+                                <div class="card mb-4">
+                                    <div class="card-body text-center">
+                                        <h5 class="card-title">Хотите стать волонтером?</h5>
+                                        <p class="card-text">Заполните анкету для участия в мероприятии</p>
+                                        <a href="/post/{{ post.id }}/volunteer" class="btn btn-success">Подать заявку</a>
+                                    </div>
+                                </div>
+                            {% else %}
+                                <div class="alert alert-info">
+                                    <h5>Вы уже подали заявку на это мероприятие</h5>
+                                    <p>Статус: 
+                                        {% if existing_form.status == 'pending' %}⏳ На рассмотрении
+                                        {% elif existing_form.status == 'approved' %}✅ Одобрена
+                                        {% elif existing_form.status == 'rejected' %}❌ Отклонена
+                                        {% else %}{{ existing_form.status }}{% endif %}
+                                    </p>
+                                </div>
+                            {% endif %}
+                        {% else %}
+                            <!-- Для автора поста - показываем список заявок -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5 class="card-title mb-0">📋 Заявки волонтеров</h5>
+                                </div>
+                                <div class="card-body">
+                                    {% if volunteer_forms %}
+                                        {% for form in volunteer_forms %}
+                                        <div class="card mb-3">
+                                            <div class="card-body">
+                                                <h6 class="card-title">{{ form.full_name }} (@{{ form.username }})</h6>
+                                                <p class="card-text">
+                                                    <strong>Контакты:</strong> {{ form.contact_info }}<br>
+                                                    <strong>Возраст:</strong> {{ form.age }} лет<br>
+                                                    <strong>Опыт:</strong> {{ form.experience }}<br>
+                                                    {% if form.comment %}<strong>Комментарий:</strong> {{ form.comment }}{% endif %}
+                                                </p>
+                                                <div class="d-flex justify-content-between align-items-center">
+                                                    <span class="badge {% if form.status == 'pending' %}bg-warning{% elif form.status == 'approved' %}bg-success{% else %}bg-danger{% endif %}">
+                                                        {% if form.status == 'pending' %}⏳ На рассмотрении
+                                                        {% elif form.status == 'approved' %}✅ Одобрена
+                                                        {% elif form.status == 'rejected' %}❌ Отклонена
+                                                        {% else %}{{ form.status }}{% endif %}
+                                                    </span>
+                                                    <div>
+                                                        <form action="/volunteer_form/{{ form.id }}/update_status" method="POST" class="d-inline">
+                                                            <button type="submit" name="status" value="approved" class="btn btn-success btn-sm">Одобрить</button>
+                                                            <button type="submit" name="status" value="rejected" class="btn btn-danger btn-sm">Отклонить</button>
+                                                        </form>
+                                                        <a href="/chat/{{ form.user_id }}" class="btn btn-primary btn-sm">Написать</a>
+                                                    </div>
+                                                </div>
+                                                <small class="text-muted">Подана: {{ form.created_at }}</small>
+                                            </div>
+                                        </div>
+                                        {% endfor %}
+                                    {% else %}
+                                        <p class="text-muted">Пока нет заявок от волонтеров</p>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        {% endif %}
+                    {% endif %}
+                    
+                    <div class="mt-3">
+                        <a href="/feed" class="btn btn-secondary">← Назад к ленте</a>
+                    </div>
+                </div>
+            </body>
+            </html>
+        ''',
+        'volunteer_form.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Анкета волонтера - {{ post.title }}</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <div class="row justify-content-center">
+                        <div class="col-md-8">
+                            <div class="card">
+                                <div class="card-body">
+                                    <h2 class="card-title text-center">Анкета волонтера</h2>
+                                    <h5 class="card-subtitle mb-4 text-center text-muted">Мероприятие: "{{ post.title }}"</h5>
+                                    
+                                    {% with messages = get_flashed_messages() %}{% if messages %}{% for message in messages %}<div class="alert alert-danger">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}
+                                    
+                                    <form method="POST">
+                                        <div class="mb-3">
+                                            <label class="form-label">Полное имя *</label>
+                                            <input type="text" class="form-control" name="full_name" required 
+                                                   value="{{ session.get('user_full_name', '') }}">
+                                        </div>
+                                        
+                                        <div class="mb-3">
+                                            <label class="form-label">Имя пользователя *</label>
+                                            <input type="text" class="form-control" name="username" required 
+                                                   value="{{ session.get('username', '') }}">
+                                        </div>
+                                        
+                                        <div class="mb-3">
+                                            <label class="form-label">Контактные данные *</label>
+                                            <input type="text" class="form-control" name="contact_info" required 
+                                                   placeholder="Телефон, email или другие контакты">
+                                            <div class="form-text">Укажите, как с вами связаться</div>
+                                        </div>
+                                        
+                                        <div class="mb-3">
+                                            <label class="form-label">Возраст *</label>
+                                            <input type="number" class="form-control" name="age" required min="14" max="100">
+                                        </div>
+                                        
+                                        <div class="mb-3">
+                                            <label class="form-label">Опыт волонтерства *</label>
+                                            <select class="form-select" name="experience" required>
+                                                <option value="">Выберите опыт</option>
+                                                <option value="Нет опыта">Нет опыта</option>
+                                                <option value="Менее 1 года">Менее 1 года</option>
+                                                <option value="1-3 года">1-3 года</option>
+                                                <option value="Более 3 лет">Более 3 лет</option>
+                                                <option value="Профессиональный волонтер">Профессиональный волонтер</option>
+                                            </select>
+                                        </div>
+                                        
+                                        <div class="mb-3">
+                                            <label class="form-label">Комментарий</label>
+                                            <textarea class="form-control" name="comment" rows="3" 
+                                                      placeholder="Расскажите о себе, почему хотите участвовать, какие навыки можете применить..."></textarea>
+                                        </div>
+                                        
+                                        <div class="d-grid gap-2">
+                                            <button type="submit" class="btn btn-success btn-lg">Отправить заявку</button>
+                                            <a href="/post/{{ post.id }}" class="btn btn-secondary">Отмена</a>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </body>
             </html>
@@ -591,7 +975,34 @@ def render_template(template_name, **context):
                                     </div>
                                 </div>
                             </div>
+                            
+                            <!-- Мои заявки -->
+                            <div class="card mt-4">
+                                <div class="card-header">
+                                    <h5 class="card-title mb-0">📨 Мои заявки</h5>
+                                </div>
+                                <div class="card-body">
+                                    {% if forms %}
+                                        {% for form in forms %}
+                                        <div class="mb-3 p-2 border rounded">
+                                            <h6>{{ form.post_title }}</h6>
+                                            <span class="badge {% if form.status == 'pending' %}bg-warning{% elif form.status == 'approved' %}bg-success{% else %}bg-danger{% endif %}">
+                                                {% if form.status == 'pending' %}⏳ На рассмотрении
+                                                {% elif form.status == 'approved' %}✅ Одобрена
+                                                {% elif form.status == 'rejected' %}❌ Отклонена
+                                                {% else %}{{ form.status }}{% endif %}
+                                            </span>
+                                            <br>
+                                            <small class="text-muted">Подана: {{ form.created_at[:16] }}</small>
+                                        </div>
+                                        {% endfor %}
+                                    {% else %}
+                                        <p class="text-muted">У вас пока нет заявок</p>
+                                    {% endif %}
+                                </div>
+                            </div>
                         </div>
+                        
                         <div class="col-md-8">
                             <h4>Мои посты ({{ posts|length }})</h4>
                             {% for post in posts %}
@@ -600,12 +1011,17 @@ def render_template(template_name, **context):
                                     <h5 class="card-title">{{ post.title }}</h5>
                                     <p class="card-text">{{ post.content[:200] }}{% if post.content|length > 200 %}...{% endif %}</p>
                                     <p class="card-text"><small class="text-muted">{{ post.created_at }}</small></p>
-                                    <form action="/post/{{ post.id }}/delete" method="POST" class="d-inline">
-                                        <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить</button>
-                                    </form>
+                                    <div class="btn-group">
+                                        <a href="/post/{{ post.id }}" class="btn btn-outline-primary btn-sm">Подробнее</a>
+                                        <form action="/post/{{ post.id }}/delete" method="POST" class="d-inline">
+                                            <button type="submit" class="btn btn-outline-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить</button>
+                                        </form>
+                                    </div>
                                 </div>
                             </div>
-                            {% else %}<div class="alert alert-info">У вас пока нет постов</div>{% endfor %}
+                            {% else %}
+                            <div class="alert alert-info">У вас пока нет постов</div>
+                            {% endfor %}
                         </div>
                     </div>
                 </div>
