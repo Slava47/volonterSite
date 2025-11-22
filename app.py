@@ -102,6 +102,47 @@ def init_db():
         ''')
         db.commit()
 
+def upgrade_db():
+    """Добавляет недостающие колонки в существующую БД"""
+    with app.app_context():
+        db = get_db()
+        
+        # Проверяем и добавляем колонку needs_volunteers если её нет
+        try:
+            db.execute('SELECT needs_volunteers FROM posts LIMIT 1')
+            print("✅ Колонка needs_volunteers уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Добавляем колонку needs_volunteers в таблицу posts...")
+            db.execute('ALTER TABLE posts ADD COLUMN needs_volunteers BOOLEAN DEFAULT FALSE')
+            db.commit()
+            print("✅ Колонка needs_volunteers добавлена")
+        
+        # Проверяем существование таблицы volunteer_forms
+        try:
+            db.execute('SELECT 1 FROM volunteer_forms LIMIT 1')
+            print("✅ Таблица volunteer_forms уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу volunteer_forms...")
+            db.execute('''
+                CREATE TABLE volunteer_forms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    post_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    full_name TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    contact_info TEXT NOT NULL,
+                    age INTEGER NOT NULL,
+                    experience TEXT NOT NULL,
+                    comment TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (post_id) REFERENCES posts (id),
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица volunteer_forms создана")
+
 @app.teardown_appcontext
 def close_connection(exception):
     db = getattr(g, '_database', None)
@@ -1195,5 +1236,6 @@ def render_template(template_name, **context):
 if __name__ == '__main__':
     with app.app_context():
         init_db()
+        upgrade_db()  # <-- Добавьте эту строку
     debug_mode = os.environ.get('FLASK_ENV') != 'production'
     app.run(host='0.0.0.0', port=5000, debug=debug_mode)
