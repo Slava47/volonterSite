@@ -355,7 +355,262 @@ def upgrade_db():
             ''')
             db.commit()
             print("✅ Таблица volunteer_forms создана")
-
+def migrate_db():
+    """Миграция для добавления новых колонок в существующую БД"""
+    with app.app_context():
+        db = get_db()
+        
+        # Проверяем и добавляем колонку role если её нет
+        try:
+            db.execute('SELECT role FROM users LIMIT 1')
+            print("✅ Колонка role уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Добавляем колонку role в таблицу users...")
+            db.execute('ALTER TABLE users ADD COLUMN role TEXT DEFAULT "volunteer"')
+            # Обновляем существующих пользователей
+            db.execute('UPDATE users SET role = "volunteer" WHERE role IS NULL')
+            db.commit()
+            print("✅ Колонка role добавлена")
+        
+        # Проверяем и добавляем колонку organization_name если её нет
+        try:
+            db.execute('SELECT organization_name FROM users LIMIT 1')
+            print("✅ Колонка organization_name уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Добавляем колонку organization_name в таблицу users...")
+            db.execute('ALTER TABLE users ADD COLUMN organization_name TEXT')
+            db.commit()
+            print("✅ Колонка organization_name добавлена")
+        
+        # Проверяем и добавляем колонку organization_description если её нет
+        try:
+            db.execute('SELECT organization_description FROM users LIMIT 1')
+            print("✅ Колонка organization_description уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Добавляем колонку organization_description в таблицу users...")
+            db.execute('ALTER TABLE users ADD COLUMN organization_description TEXT')
+            db.commit()
+            print("✅ Колонка organization_description добавлена")
+        
+        # Проверяем и добавляем колонку organization_contact если её нет
+        try:
+            db.execute('SELECT organization_contact FROM users LIMIT 1')
+            print("✅ Колонка organization_contact уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Добавляем колонку organization_contact в таблицу users...")
+            db.execute('ALTER TABLE users ADD COLUMN organization_contact TEXT')
+            db.commit()
+            print("✅ Колонка organization_contact добавлена")
+        
+        # Проверяем и добавляем колонку is_visible если её нет
+        try:
+            db.execute('SELECT is_visible FROM users LIMIT 1')
+            print("✅ Колонка is_visible уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Добавляем колонку is_visible в таблицу users...")
+            db.execute('ALTER TABLE users ADD COLUMN is_visible BOOLEAN DEFAULT TRUE')
+            db.commit()
+            print("✅ Колонка is_visible добавлена")
+        
+        # Проверяем существование таблицы reports
+        try:
+            db.execute('SELECT 1 FROM reports LIMIT 1')
+            print("✅ Таблица reports уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу reports...")
+            db.execute('''
+                CREATE TABLE reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reporter_id INTEGER NOT NULL,
+                    reported_rating_id INTEGER,
+                    reported_post_id INTEGER,
+                    report_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (reporter_id) REFERENCES users (id),
+                    FOREIGN KEY (reported_rating_id) REFERENCES ratings (id),
+                    FOREIGN KEY (reported_post_id) REFERENCES posts (id)
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица reports создана")
+        
+        # Проверяем существование таблицы achievements
+        try:
+            db.execute('SELECT 1 FROM achievements LIMIT 1')
+            print("✅ Таблица achievements уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу achievements...")
+            db.execute('''
+                CREATE TABLE achievements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    icon TEXT,
+                    condition TEXT
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица achievements создана")
+            
+            # Добавляем базовые достижения
+            achievements = [
+                ('Первый шаг', 'Создал первый пост', '🎯', 'first_post'),
+                ('Волонтер', 'Подал 5 заявок', '🤝', 'five_applications'),
+                ('Организатор', 'Организовал 3 мероприятия', '⭐', 'three_events'),
+                ('Активный участник', '10 одобренных заявок', '🏆', 'ten_approved'),
+                ('Супер-волонтер', 'Помог в 10+ мероприятиях', '👑', 'super_volunteer')
+            ]
+            
+            for achievement in achievements:
+                try:
+                    db.execute('INSERT INTO achievements (name, description, icon, condition) VALUES (?, ?, ?, ?)', achievement)
+                except sqlite3.IntegrityError:
+                    pass
+            db.commit()
+        
+        # Проверяем существование таблицы user_achievements
+        try:
+            db.execute('SELECT 1 FROM user_achievements LIMIT 1')
+            print("✅ Таблица user_achievements уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу user_achievements...")
+            db.execute('''
+                CREATE TABLE user_achievements (
+                    user_id INTEGER,
+                    achievement_id INTEGER,
+                    achieved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id),
+                    FOREIGN KEY (achievement_id) REFERENCES achievements (id),
+                    PRIMARY KEY (user_id, achievement_id)
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица user_achievements создана")
+        
+        # Проверяем существование таблицы notifications
+        try:
+            db.execute('SELECT 1 FROM notifications LIMIT 1')
+            print("✅ Таблица notifications уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу notifications...")
+            db.execute('''
+                CREATE TABLE notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    is_read BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица notifications создана")
+        
+        # Проверяем существование таблицы categories
+        try:
+            db.execute('SELECT 1 FROM categories LIMIT 1')
+            print("✅ Таблица categories уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу categories...")
+            db.execute('''
+                CREATE TABLE categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица categories создана")
+            
+            # Добавляем базовые категории
+            default_categories = [
+                ('Экология', 'Уборка территорий, посадка деревьев'),
+                ('Животные', 'Помощь приютам, забота о животных'),
+                ('Дети', 'Работа с детьми, образовательные программы'),
+                ('Пожилые', 'Помощь пожилым людям'),
+                ('Медицина', 'Медицинская помощь, донорство'),
+                ('Культура', 'Культурные мероприятия, события'),
+                ('Образование', 'Обучение, репетиторство'),
+                ('ЧС', 'Помощь в чрезвычайных ситуациях')
+            ]
+            
+            for category in default_categories:
+                try:
+                    db.execute('INSERT INTO categories (name, description) VALUES (?, ?)', category)
+                except sqlite3.IntegrityError:
+                    pass
+            db.commit()
+        
+        # Проверяем существование таблицы post_categories
+        try:
+            db.execute('SELECT 1 FROM post_categories LIMIT 1')
+            print("✅ Таблица post_categories уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу post_categories...")
+            db.execute('''
+                CREATE TABLE post_categories (
+                    post_id INTEGER,
+                    category_id INTEGER,
+                    FOREIGN KEY (post_id) REFERENCES posts (id),
+                    FOREIGN KEY (category_id) REFERENCES categories (id),
+                    PRIMARY KEY (post_id, category_id)
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица post_categories создана")
+        
+        # Проверяем существование таблицы ratings
+        try:
+            db.execute('SELECT 1 FROM ratings LIMIT 1')
+            print("✅ Таблица ratings уже существует")
+        except sqlite3.OperationalError:
+            print("🔄 Создаем таблицу ratings...")
+            db.execute('''
+                CREATE TABLE ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_user_id INTEGER NOT NULL,
+                    to_user_id INTEGER NOT NULL,
+                    post_id INTEGER,
+                    rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+                    comment TEXT,
+                    is_reported BOOLEAN DEFAULT FALSE,
+                    report_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (from_user_id) REFERENCES users (id),
+                    FOREIGN KEY (to_user_id) REFERENCES users (id),
+                    FOREIGN KEY (post_id) REFERENCES posts (id),
+                    UNIQUE(from_user_id, to_user_id, post_id)
+                )
+            ''')
+            db.commit()
+            print("✅ Таблица ratings создана")
+        
+        # Создаем аккаунты модераторов если их нет
+        moderators = [
+            ('moderator1', 'moderator1@example.com', 'Moderator123!', 'Алексей Модераторов', 'moderator'),
+            ('moderator2', 'moderator2@example.com', 'Moderator123!', 'Мария Модераторова', 'moderator'),
+            ('moderator3', 'moderator3@example.com', 'Moderator123!', 'Иван Модераторов', 'moderator'),
+            ('moderator4', 'moderator4@example.com', 'Moderator123!', 'Елена Модераторова', 'moderator'),
+            ('moderator5', 'moderator5@example.com', 'Moderator123!', 'Дмитрий Модераторов', 'moderator')
+        ]
+        
+        for mod in moderators:
+            existing = db.execute('SELECT id FROM users WHERE username = ?', (mod[0],)).fetchone()
+            if not existing:
+                try:
+                    db.execute(
+                        "INSERT INTO users (username, email, password, full_name, role, is_visible) VALUES (?, ?, ?, ?, ?, ?)",
+                        (mod[0], mod[1], generate_password_hash(mod[2]), mod[3], mod[4], False)
+                    )
+                    print(f"✅ Создан аккаунт модератора: {mod[0]}")
+                except sqlite3.IntegrityError:
+                    print(f"⚠️ Аккаунт модератора {mod[0]} уже существует")
+        
+        db.commit()
+        print("🎉 Миграция базы данных завершена успешно!")
 @app.teardown_appcontext
 def close_connection(exception):
     db = getattr(g, '_database', None)
@@ -2923,5 +3178,6 @@ if __name__ == '__main__':
     with app.app_context():
         init_db()
         upgrade_db()
+        migrate_db()  # <-- Добавь эту строку
     debug_mode = os.environ.get('FLASK_ENV') != 'production'
     app.run(host='0.0.0.0', port=5000, debug=debug_mode)
