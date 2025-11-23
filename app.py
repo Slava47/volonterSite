@@ -1,13 +1,64 @@
 import os
 import sqlite3
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash, session, g, jsonify
+import secrets
+import shutil
+import logging
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from flask import Flask, render_template, request, redirect, url_for, flash, session, g, jsonify, render_template_string
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 app.config['DATABASE'] = '/app/data/volunteer_network.db'
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FLASK_ENV') == 'production'
+
+# Настройка логирования
+if not app.debug:
+    if not os.path.exists('/app/data/logs'):
+        os.makedirs('/app/data/logs')
+    
+    file_handler = RotatingFileHandler('/app/data/logs/volunteer_network.log', 
+                                     maxBytes=10240, backupCount=10)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+    ))
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('Volunteer Network startup')
+
+class RateLimiter:
+    def __init__(self):
+        self.requests = {}
+    
+    def is_limited(self, key, limit=5, period=60):
+        now = datetime.now()
+        if key not in self.requests:
+            self.requests[key] = []
+        
+        # Удаляем старые запросы
+        self.requests[key] = [req_time for req_time in self.requests[key] 
+                             if now - req_time < timedelta(seconds=period)]
+        
+        if len(self.requests[key]) >= limit:
+            return True
+        
+        self.requests[key].append(now)
+        return False
+
+rate_limiter = RateLimiter()
+
+def rate_limit(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if rate_limiter.is_limited(f"{request.remote_addr}_{request.endpoint}"):
+            flash('Слишком много запросов. Пожалуйста, подождите.')
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 def login_required(f):
     @wraps(f)
@@ -25,6 +76,18 @@ def get_db():
         db = g._database = sqlite3.connect(app.config['DATABASE'])
         db.row_factory = sqlite3.Row
     return db
+
+def validate_password(password):
+    """Проверка сложности пароля"""
+    if len(password) < 8:
+        return "Пароль должен содержать минимум 8 символов"
+    if not any(c.isupper() for c in password):
+        return "Пароль должен содержать хотя бы одну заглавную букву"
+    if not any(c.islower() for c in password):
+        return "Пароль должен содержать хотя бы одну строчную букву"
+    if not any(c.isdigit() for c in password):
+        return "Пароль должен содержать хотя бы одну цифру"
+    return None
 
 def init_db():
     with app.app_context():
@@ -100,6 +163,107 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
+        # Таблица уведомлений
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        # Таблица категорий
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT
+            )
+        ''')
+        # Таблица связи постов и категорий
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS post_categories (
+                post_id INTEGER,
+                category_id INTEGER,
+                FOREIGN KEY (post_id) REFERENCES posts (id),
+                FOREIGN KEY (category_id) REFERENCES categories (id),
+                PRIMARY KEY (post_id, category_id)
+            )
+        ''')
+        # Таблица рейтингов
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user_id INTEGER NOT NULL,
+                to_user_id INTEGER NOT NULL,
+                post_id INTEGER,
+                rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+                comment TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (from_user_id) REFERENCES users (id),
+                FOREIGN KEY (to_user_id) REFERENCES users (id),
+                FOREIGN KEY (post_id) REFERENCES posts (id),
+                UNIQUE(from_user_id, to_user_id, post_id)
+            )
+        ''')
+        # Таблица достижений
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS achievements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT,
+                icon TEXT,
+                condition TEXT
+            )
+        ''')
+        # Таблица достижений пользователей
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS user_achievements (
+                user_id INTEGER,
+                achievement_id INTEGER,
+                achieved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id),
+                FOREIGN KEY (achievement_id) REFERENCES achievements (id),
+                PRIMARY KEY (user_id, achievement_id)
+            )
+        ''')
+        
+        # Добавляем базовые категории
+        default_categories = [
+            ('Экология', 'Уборка территорий, посадка деревьев'),
+            ('Животные', 'Помощь приютам, забота о животных'),
+            ('Дети', 'Работа с детьми, образовательные программы'),
+            ('Пожилые', 'Помощь пожилым людям'),
+            ('Медицина', 'Медицинская помощь, донорство'),
+            ('Культура', 'Культурные мероприятия, события'),
+            ('Образование', 'Обучение, репетиторство'),
+            ('ЧС', 'Помощь в чрезвычайных ситуациях')
+        ]
+        
+        for category in default_categories:
+            try:
+                db.execute('INSERT INTO categories (name, description) VALUES (?, ?)', category)
+            except sqlite3.IntegrityError:
+                pass
+        
+        # Базовые достижения
+        achievements = [
+            ('Первый шаг', 'Создал первый пост', '🎯', 'first_post'),
+            ('Волонтер', 'Подал 5 заявок', '🤝', 'five_applications'),
+            ('Организатор', 'Организовал 3 мероприятия', '⭐', 'three_events'),
+            ('Активный участник', '10 одобренных заявок', '🏆', 'ten_approved'),
+            ('Супер-волонтер', 'Помог в 10+ мероприятиях', '👑', 'super_volunteer')
+        ]
+        
+        for achievement in achievements:
+            try:
+                db.execute('INSERT INTO achievements (name, description, icon, condition) VALUES (?, ?, ?, ?)', achievement)
+            except sqlite3.IntegrityError:
+                pass
+        
         db.commit()
 
 def upgrade_db():
@@ -187,6 +351,74 @@ def get_user_chats(user_id):
     ''', (user_id, user_id, user_id, user_id, user_id, user_id)).fetchall()
     return chats
 
+def create_notification(user_id, title, message):
+    db = get_db()
+    db.execute(
+        'INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)',
+        (user_id, title, message)
+    )
+    db.commit()
+
+def get_user_rating(user_id):
+    db = get_db()
+    result = db.execute('''
+        SELECT AVG(rating) as avg_rating, COUNT(*) as rating_count 
+        FROM ratings 
+        WHERE to_user_id = ?
+    ''', (user_id,)).fetchone()
+    return result
+
+def check_achievements(user_id):
+    db = get_db()
+    
+    # Проверяем условия и награждаем достижениями
+    user_posts_count = db.execute('SELECT COUNT(*) FROM posts WHERE user_id = ?', 
+                                (user_id,)).fetchone()[0]
+    user_forms_count = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE user_id = ?', 
+                                (user_id,)).fetchone()[0]
+    approved_forms_count = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE user_id = ? AND status = "approved"', 
+                                    (user_id,)).fetchone()[0]
+    
+    # Проверяем достижения
+    achievements_to_check = [
+        ('first_post', user_posts_count >= 1),
+        ('five_applications', user_forms_count >= 5),
+        ('three_events', user_posts_count >= 3),
+        ('ten_approved', approved_forms_count >= 10),
+        ('super_volunteer', approved_forms_count >= 10)
+    ]
+    
+    for condition, achieved in achievements_to_check:
+        if achieved:
+            achievement = db.execute('SELECT id FROM achievements WHERE condition = ?', (condition,)).fetchone()
+            if achievement:
+                try:
+                    db.execute('INSERT OR IGNORE INTO user_achievements (user_id, achievement_id) VALUES (?, ?)',
+                             (user_id, achievement['id']))
+                    db.commit()
+                except sqlite3.IntegrityError:
+                    pass
+    
+    user_achievements = db.execute('''
+        SELECT a.* FROM achievements a
+        JOIN user_achievements ua ON a.id = ua.achievement_id
+        WHERE ua.user_id = ?
+    ''', (user_id,)).fetchall()
+    
+    return user_achievements
+
+# Обработчики ошибок
+@app.errorhandler(404)
+def not_found_error(error):
+    return render_template('404.html'), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.rollback()
+    return render_template('500.html'), 500
+
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -206,6 +438,11 @@ def register():
         
         if not username or not password or not email:
             error = 'Все поля обязательны для заполнения'
+        
+        # Проверка сложности пароля
+        password_error = validate_password(password)
+        if password_error:
+            error = password_error
         
         if error is None:
             try:
@@ -272,7 +509,14 @@ def profile():
         ORDER BY vf.created_at DESC
     ''', (session['user_id'],)).fetchall()
     
-    return render_template('profile.html', user=user, posts=user_posts, forms=user_forms)
+    # Получаем рейтинг пользователя
+    user_rating = get_user_rating(session['user_id'])
+    
+    # Получаем достижения
+    user_achievements = check_achievements(session['user_id'])
+    
+    return render_template('profile.html', user=user, posts=user_posts, forms=user_forms, 
+                         user_rating=user_rating, achievements=user_achievements)
 
 @app.route('/profile/edit', methods=['GET', 'POST'])
 @login_required
@@ -325,6 +569,9 @@ def feed():
 @app.route('/post/create', methods=['GET', 'POST'])
 @login_required
 def create_post():
+    db = get_db()
+    categories = db.execute('SELECT * FROM categories').fetchall()
+    
     if request.method == 'POST':
         title = request.form['title']
         content = request.form['content']
@@ -332,21 +579,34 @@ def create_post():
         location = request.form.get('location', '')
         event_date = request.form.get('event_date', '')
         needs_volunteers = 'needs_volunteers' in request.form
+        selected_categories = request.form.getlist('categories')
         
         if not title or not content:
             flash('Заголовок и содержание обязательны')
             return redirect(url_for('create_post'))
         
-        db = get_db()
-        db.execute(
+        cursor = db.execute(
             'INSERT INTO posts (user_id, title, content, post_type, location, event_date, needs_volunteers) VALUES (?, ?, ?, ?, ?, ?, ?)',
             (session['user_id'], title, content, post_type, location, event_date, needs_volunteers)
         )
+        post_id = cursor.lastrowid
+        
+        # Добавляем категории
+        for category_id in selected_categories:
+            db.execute(
+                'INSERT INTO post_categories (post_id, category_id) VALUES (?, ?)',
+                (post_id, category_id)
+            )
+        
         db.commit()
+        
+        # Проверяем достижения
+        check_achievements(session['user_id'])
+        
         flash('Пост успешно создан!')
         return redirect(url_for('feed'))
     
-    return render_template('create_post.html')
+    return render_template('create_post.html', categories=categories)
 
 @app.route('/post/<int:post_id>')
 @login_required
@@ -362,6 +622,13 @@ def post_detail(post_id):
     if post is None:
         flash('Пост не найден')
         return redirect(url_for('feed'))
+    
+    # Получаем категории поста
+    post_categories = db.execute('''
+        SELECT c.* FROM categories c
+        JOIN post_categories pc ON c.id = pc.category_id
+        WHERE pc.post_id = ?
+    ''', (post_id,)).fetchall()
     
     # Проверяем, подавал ли пользователь уже анкету на этот пост
     existing_form = db.execute(
@@ -383,7 +650,8 @@ def post_detail(post_id):
     return render_template('post_detail.html', 
                          post=post, 
                          existing_form=existing_form,
-                         volunteer_forms=volunteer_forms)
+                         volunteer_forms=volunteer_forms,
+                         categories=post_categories)
 
 @app.route('/post/<int:post_id>/volunteer', methods=['GET', 'POST'])
 @login_required
@@ -444,6 +712,14 @@ def volunteer_for_post(post_id):
         )
         db.commit()
         
+        # Создаем уведомление для автора поста
+        create_notification(post['user_id'], 
+                          'Новая заявка на ваше мероприятие', 
+                          f'Пользователь {full_name} подал заявку на мероприятие "{post["title"]}"')
+        
+        # Проверяем достижения
+        check_achievements(session['user_id'])
+        
         flash('Ваша анкета успешно отправлена! Организатор свяжется с вами.')
         return redirect(url_for('post_detail', post_id=post_id))
     
@@ -494,7 +770,16 @@ def update_form_status(form_id):
         'INSERT INTO messages (chat_id, sender_id, message_text) VALUES (?, ?, ?)',
         (chat['id'], session['user_id'], notification_message)
     )
+    
+    # Создаем уведомление для волонтера
+    create_notification(form['user_id'], 
+                      'Обновление статуса заявки', 
+                      f'Статус вашей заявки на мероприятие "{form["post_title"]}" изменен на: {status_text.get(new_status, new_status)}')
+    
     db.commit()
+    
+    # Проверяем достижения
+    check_achievements(form['user_id'])
     
     flash('Статус анкеты обновлен')
     return redirect(url_for('post_detail', post_id=form['post_id']))
@@ -549,6 +834,7 @@ def chat_with_user(user_id):
 
 @app.route('/api/send_message', methods=['POST'])
 @login_required
+@rate_limit
 def send_message():
     data = request.get_json()
     chat_id = data.get('chat_id')
@@ -623,10 +909,283 @@ def users_list():
         WHERE id != ? 
         ORDER BY username
     ''', (session['user_id'],)).fetchall()
-    return render_template('users_list.html', users=users)
+    
+    # Добавляем рейтинги для пользователей
+    users_with_ratings = []
+    for user in users:
+        rating = get_user_rating(user['id'])
+        users_with_ratings.append({
+            'id': user['id'],
+            'username': user['username'],
+            'full_name': user['full_name'],
+            'bio': user['bio'],
+            'skills': user['skills'],
+            'rating': rating
+        })
+    
+    return render_template('users_list.html', users=users_with_ratings)
 
+@app.route('/user/<int:user_id>/rate', methods=['POST'])
+@login_required
+def rate_user(user_id):
+    rating = request.form.get('rating')
+    comment = request.form.get('comment', '')
+    post_id = request.form.get('post_id')
+    
+    if not rating or not rating.isdigit() or int(rating) < 1 or int(rating) > 5:
+        flash('Некорректный рейтинг')
+        return redirect(request.referrer or url_for('profile'))
+    
+    db = get_db()
+    
+    try:
+        db.execute(
+            'INSERT INTO ratings (from_user_id, to_user_id, post_id, rating, comment) VALUES (?, ?, ?, ?, ?)',
+            (session['user_id'], user_id, post_id, rating, comment)
+        )
+        db.commit()
+        flash('Отзыв успешно добавлен!')
+    except sqlite3.IntegrityError:
+        flash('Вы уже оставляли отзыв этому пользователю')
+    
+    return redirect(request.referrer or url_for('profile'))
+
+# Новые маршруты для дополнительного функционала
+
+@app.route('/notifications')
+@login_required
+def notifications():
+    db = get_db()
+    user_notifications = db.execute(
+        'SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC',
+        (session['user_id'],)
+    ).fetchall()
+    
+    # Помечаем как прочитанные
+    db.execute(
+        'UPDATE notifications SET is_read = TRUE WHERE user_id = ?',
+        (session['user_id'],)
+    )
+    db.commit()
+    
+    return render_template('notifications.html', notifications=user_notifications)
+
+@app.route('/api/notifications/count')
+@login_required
+def notifications_count():
+    db = get_db()
+    count = db.execute(
+        'SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = FALSE',
+        (session['user_id'],)
+    ).fetchone()[0]
+    return jsonify({'count': count})
+
+@app.route('/search')
+@login_required
+def search():
+    query = request.args.get('q', '')
+    category = request.args.get('category', '')
+    location = request.args.get('location', '')
+    post_type = request.args.get('type', '')
+    
+    db = get_db()
+    
+    sql = '''
+        SELECT DISTINCT p.*, u.username, u.full_name 
+        FROM posts p 
+        JOIN users u ON p.user_id = u.id 
+        LEFT JOIN post_categories pc ON p.id = pc.post_id 
+        LEFT JOIN categories c ON pc.category_id = c.id 
+        WHERE 1=1
+    '''
+    params = []
+    
+    if query:
+        sql += ' AND (p.title LIKE ? OR p.content LIKE ? OR p.location LIKE ?)'
+        params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+    
+    if category:
+        sql += ' AND c.name = ?'
+        params.append(category)
+    
+    if location:
+        sql += ' AND p.location LIKE ?'
+        params.append(f'%{location}%')
+    
+    if post_type:
+        sql += ' AND p.post_type = ?'
+        params.append(post_type)
+    
+    sql += ' ORDER BY p.created_at DESC'
+    
+    posts = db.execute(sql, params).fetchall()
+    categories = db.execute('SELECT * FROM categories').fetchall()
+    
+    return render_template('search.html', 
+                         posts=posts, 
+                         categories=categories,
+                         search_query=query)
+
+@app.route('/calendar')
+@login_required
+def calendar():
+    db = get_db()
+    events = db.execute('''
+        SELECT p.*, u.username, u.full_name 
+        FROM posts p 
+        JOIN users u ON p.user_id = u.id 
+        WHERE p.event_date IS NOT NULL AND p.event_date != ''
+        ORDER BY p.event_date
+    ''').fetchall()
+    
+    return render_template('calendar.html', events=events)
+
+@app.route('/api/events')
+@login_required
+def api_events():
+    db = get_db()
+    events = db.execute('''
+        SELECT id, title, event_date as start, location 
+        FROM posts 
+        WHERE event_date IS NOT NULL AND event_date != ''
+    ''').fetchall()
+    
+    events_list = []
+    for event in events:
+        events_list.append({
+            'id': event['id'],
+            'title': event['title'],
+            'start': event['start'],
+            'location': event['location'],
+            'url': f"/post/{event['id']}"
+        })
+    
+    return jsonify(events_list)
+
+@app.route('/stats')
+@login_required
+def stats():
+    db = get_db()
+    
+    # Общая статистика
+    total_posts = db.execute('SELECT COUNT(*) FROM posts').fetchone()[0]
+    total_users = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    total_volunteers = db.execute('SELECT COUNT(DISTINCT user_id) FROM volunteer_forms').fetchone()[0]
+    
+    # Статистика по категориям
+    categories_stats = db.execute('''
+        SELECT c.name, COUNT(pc.post_id) as post_count 
+        FROM categories c 
+        LEFT JOIN post_categories pc ON c.id = pc.category_id 
+        GROUP BY c.id 
+        ORDER BY post_count DESC
+    ''').fetchall()
+    
+    # Активность пользователя
+    user_posts_count = db.execute('SELECT COUNT(*) FROM posts WHERE user_id = ?', 
+                                (session['user_id'],)).fetchone()[0]
+    user_forms_count = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE user_id = ?', 
+                                (session['user_id'],)).fetchone()[0]
+    
+    return render_template('stats.html',
+                         total_posts=total_posts,
+                         total_users=total_users,
+                         total_volunteers=total_volunteers,
+                         categories_stats=categories_stats,
+                         user_posts_count=user_posts_count,
+                         user_forms_count=user_forms_count)
+
+@app.route('/export/my_data')
+@login_required
+def export_my_data():
+    db = get_db()
+    
+    # Собираем данные пользователя
+    user_data = {
+        'profile': dict(db.execute('SELECT * FROM users WHERE id = ?', 
+                                 (session['user_id'],)).fetchone()),
+        'posts': [dict(row) for row in 
+                 db.execute('SELECT * FROM posts WHERE user_id = ?', 
+                          (session['user_id'],)).fetchall()],
+        'volunteer_forms': [dict(row) for row in 
+                           db.execute('SELECT * FROM volunteer_forms WHERE user_id = ?', 
+                                    (session['user_id'],)).fetchall()],
+        'achievements': [dict(row) for row in 
+                        db.execute('''
+                            SELECT a.* FROM achievements a
+                            JOIN user_achievements ua ON a.id = ua.achievement_id
+                            WHERE ua.user_id = ?
+                        ''', (session['user_id'],)).fetchall()]
+    }
+    
+    return jsonify(user_data)
+
+@app.route('/admin/backup', methods=['POST'])
+@login_required
+def backup_database():
+    """Создание резервной копии базы данных"""
+    backup_path = f"/app/data/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    shutil.copy2(app.config['DATABASE'], backup_path)
+    flash(f'Резервная копия создана: {backup_path}')
+    return redirect(url_for('profile'))
+
+@app.route('/health')
+def health_check():
+    """Эндпоинт для проверки работоспособности"""
+    try:
+        db = get_db()
+        db.execute('SELECT 1')
+        return jsonify({'status': 'healthy', 'database': 'connected'})
+    except Exception as e:
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+
+# Шаблоны
 def render_template(template_name, **context):
     templates = {
+        '404.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Страница не найдена</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body class="bg-light">
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/">🎗️ Волонтерская Сеть</a>
+                    </div>
+                </nav>
+                <div class="container mt-5">
+                    <div class="row justify-content-center">
+                        <div class="col-md-6 text-center">
+                            <h1>404</h1>
+                            <p>Страница не найдена</p>
+                            <a href="/" class="btn btn-primary">На главную</a>
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
+        ''',
+        '500.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Ошибка сервера</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body class="bg-light">
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/">🎗️ Волонтерская Сеть</a>
+                    </div>
+                </nav>
+                <div class="container mt-5">
+                    <div class="row justify-content-center">
+                        <div class="col-md-6 text-center">
+                            <h1>500</h1>
+                            <p>Внутренняя ошибка сервера</p>
+                            <a href="/" class="btn btn-primary">На главную</a>
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
+        ''',
         'index.html': '''
             <!DOCTYPE html>
             <html>
@@ -667,7 +1226,8 @@ def render_template(template_name, **context):
                                         <div class="mb-3"><label class="form-label">Имя пользователя *</label><input type="text" class="form-control" name="username" required></div>
                                         <div class="mb-3"><label class="form-label">Email *</label><input type="email" class="form-control" name="email" required></div>
                                         <div class="mb-3"><label class="form-label">Полное имя</label><input type="text" class="form-control" name="full_name"></div>
-                                        <div class="mb-3"><label class="form-label">Пароль *</label><input type="password" class="form-control" name="password" required></div>
+                                        <div class="mb-3"><label class="form-label">Пароль *</label><input type="password" class="form-control" name="password" required>
+                                        <div class="form-text">Пароль должен содержать минимум 8 символов, заглавные и строчные буквы, цифры</div></div>
                                         <button type="submit" class="btn btn-primary w-100">Зарегистрироваться</button>
                                     </form>
                                     <div class="text-center mt-3"><a href="/login">Уже есть аккаунт? Войдите</a></div>
@@ -715,7 +1275,13 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/post/create">Создать пост</a>
+                            <a class="nav-link" href="/search">Поиск</a>
+                            <a class="nav-link" href="/calendar">Календарь</a>
                             <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link position-relative" href="/notifications">
+                                Уведомления
+                                <span id="notificationBadge" class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" style="display: none;">0</span>
+                            </a>
                             <a class="nav-link" href="/users">Все пользователи</a>
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
@@ -755,6 +1321,23 @@ def render_template(template_name, **context):
                     </div>
                     {% else %}<div class="alert alert-info">Пока нет постов. Будьте первым!</div>{% endfor %}
                 </div>
+                <script>
+                    function updateNotificationCount() {
+                        fetch('/api/notifications/count')
+                            .then(response => response.json())
+                            .then(data => {
+                                const badge = document.getElementById('notificationBadge');
+                                if (data.count > 0) {
+                                    badge.style.display = 'block';
+                                    badge.textContent = data.count;
+                                } else {
+                                    badge.style.display = 'none';
+                                }
+                            });
+                    }
+                    setInterval(updateNotificationCount, 30000);
+                    updateNotificationCount();
+                </script>
             </body>
             </html>
         ''',
@@ -768,6 +1351,7 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/search">Поиск</a>
                             <a class="nav-link" href="/chats">Мои чаты</a>
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
@@ -787,6 +1371,19 @@ def render_template(template_name, **context):
                             <input type="checkbox" class="form-check-input" name="needs_volunteers" id="needs_volunteers">
                             <label class="form-check-label" for="needs_volunteers">Ищу волонтеров для этого мероприятия</label>
                         </div>
+                        <div class="mb-3">
+                            <label class="form-label">Категории</label>
+                            <div class="row">
+                                {% for category in categories %}
+                                <div class="col-md-3">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" name="categories" value="{{ category.id }}" id="cat{{ category.id }}">
+                                        <label class="form-check-label" for="cat{{ category.id }}">{{ category.name }}</label>
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            </div>
+                        </div>
                         <button type="submit" class="btn btn-primary">Опубликовать</button>
                         <a href="/feed" class="btn btn-secondary">Отмена</a>
                     </form>
@@ -804,6 +1401,7 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/search">Поиск</a>
                             <a class="nav-link" href="/chats">Мои чаты</a>
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
@@ -822,6 +1420,14 @@ def render_template(template_name, **context):
                             <p class="card-text">{{ post.content }}</p>
                             {% if post.location %}<p class="card-text"><strong>Место:</strong> {{ post.location }}</p>{% endif %}
                             {% if post.event_date %}<p class="card-text"><strong>Дата:</strong> {{ post.event_date }}</p>{% endif %}
+                            {% if categories %}
+                            <p class="card-text">
+                                <strong>Категории:</strong>
+                                {% for category in categories %}
+                                <span class="badge bg-secondary me-1">{{ category.name }}</span>
+                                {% endfor %}
+                            </p>
+                            {% endif %}
                             <p class="card-text"><small class="text-muted">Опубликовано: {{ post.created_at }}</small></p>
                         </div>
                     </div>
@@ -993,6 +1599,7 @@ def render_template(template_name, **context):
                             <a class="nav-link" href="/feed">Лента</a>
                             <a class="nav-link" href="/post/create">Создать пост</a>
                             <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/stats">Статистика</a>
                             <a class="nav-link" href="/logout">Выйти</a>
                         </div>
                     </div>
@@ -1005,17 +1612,50 @@ def render_template(template_name, **context):
                                 <div class="card-body">
                                     <h3 class="card-title">{{ user.full_name or user.username }}</h3>
                                     <p class="text-muted">@{{ user.username }}</p>
+                                    {% if user_rating and user_rating.avg_rating %}
+                                    <div class="mb-3">
+                                        <strong>Рейтинг:</strong>
+                                        <div class="text-warning">
+                                            {% for i in range(5) %}
+                                                {% if i < user_rating.avg_rating|round %}
+                                                ★
+                                                {% else %}
+                                                ☆
+                                                {% endif %}
+                                            {% endfor %}
+                                            ({{ user_rating.rating_count }} отзывов)
+                                        </div>
+                                    </div>
+                                    {% endif %}
                                     {% if user.bio %}<p>{{ user.bio }}</p>{% endif %}
                                     {% if user.skills %}<p><strong>Навыки:</strong> {{ user.skills }}</p>{% endif %}
                                     <p class="text-muted">Участник с {{ user.created_at[:10] }}</p>
                                     <div class="mt-3">
                                         <a href="/profile/edit" class="btn btn-primary me-2">Редактировать</a>
+                                        <a href="/export/my_data" class="btn btn-info me-2">Экспорт данных</a>
                                         <form action="/profile/delete" method="POST" class="d-inline" onsubmit="return confirm('Удалить профиль? Это действие нельзя отменить!')">
                                             <button type="submit" class="btn btn-danger">Удалить профиль</button>
                                         </form>
                                     </div>
                                 </div>
                             </div>
+                            
+                            <!-- Достижения -->
+                            {% if achievements %}
+                            <div class="card mt-4">
+                                <div class="card-header">
+                                    <h5 class="card-title mb-0">🏆 Достижения</h5>
+                                </div>
+                                <div class="card-body">
+                                    {% for achievement in achievements %}
+                                    <div class="mb-2">
+                                        <strong>{{ achievement.icon }} {{ achievement.name }}</strong>
+                                        <br><small class="text-muted">{{ achievement.description }}</small>
+                                    </div>
+                                    {% endfor %}
+                                </div>
+                            </div>
+                            {% endif %}
                             
                             <!-- Мои заявки -->
                             <div class="card mt-4">
@@ -1214,12 +1854,316 @@ def render_template(template_name, **context):
                             <div class="card">
                                 <div class="card-body">
                                     <h5 class="card-title">{{ user.full_name or user.username }}</h5>
-                                    <p class="card-text"><small class="text-muted">@{{ user.username }}</small>{% if user.bio %}<br>{{ user.bio }}{% endif %}{% if user.skills %}<br><strong>Навыки:</strong> {{ user.skills }}{% endif %}</p>
-                                    <a href="/chat/{{ user.id }}" class="btn btn-primary btn-sm">Написать сообщение</a>
+                                    <p class="card-text"><small class="text-muted">@{{ user.username }}</small>
+                                    {% if user.rating and user.rating.avg_rating %}
+                                    <br><div class="text-warning">
+                                        {% for i in range(5) %}
+                                            {% if i < user.rating.avg_rating|round %}
+                                            ★
+                                            {% else %}
+                                            ☆
+                                            {% endif %}
+                                        {% endfor %}
+                                        ({{ user.rating.rating_count }} отзывов)
+                                    </div>
+                                    {% endif %}
+                                    {% if user.bio %}<br>{{ user.bio }}{% endif %}
+                                    {% if user.skills %}<br><strong>Навыки:</strong> {{ user.skills }}{% endif %}</p>
+                                    <div class="btn-group">
+                                        <a href="/chat/{{ user.id }}" class="btn btn-primary btn-sm">Написать сообщение</a>
+                                        <button type="button" class="btn btn-outline-success btn-sm" data-bs-toggle="modal" data-bs-target="#rateModal{{ user.id }}">Оценить</button>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Модальное окно для оценки -->
+                            <div class="modal fade" id="rateModal{{ user.id }}" tabindex="-1">
+                                <div class="modal-dialog">
+                                    <div class="modal-content">
+                                        <div class="modal-header">
+                                            <h5 class="modal-title">Оценить {{ user.full_name or user.username }}</h5>
+                                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                                        </div>
+                                        <form action="/user/{{ user.id }}/rate" method="POST">
+                                            <div class="modal-body">
+                                                <div class="mb-3">
+                                                    <label class="form-label">Оценка (1-5)</label>
+                                                    <select class="form-select" name="rating" required>
+                                                        <option value="5">5 - Отлично</option>
+                                                        <option value="4">4 - Хорошо</option>
+                                                        <option value="3">3 - Удовлетворительно</option>
+                                                        <option value="2">2 - Плохо</option>
+                                                        <option value="1">1 - Очень плохо</option>
+                                                    </select>
+                                                </div>
+                                                <div class="mb-3">
+                                                    <label class="form-label">Комментарий (необязательно)</label>
+                                                    <textarea class="form-control" name="comment" rows="3"></textarea>
+                                                </div>
+                                            </div>
+                                            <div class="modal-footer">
+                                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                                                <button type="submit" class="btn btn-primary">Отправить отзыв</button>
+                                            </div>
+                                        </form>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                         {% endfor %}
+                    </div>
+                </div>
+                <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+            </body>
+            </html>
+        ''',
+        'notifications.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Уведомления - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <h2>Уведомления</h2>
+                    {% if notifications %}
+                    <div class="list-group">
+                        {% for notification in notifications %}
+                        <div class="list-group-item {% if not notification.is_read %}list-group-item-primary{% endif %}">
+                            <div class="d-flex w-100 justify-content-between">
+                                <h5 class="mb-1">{{ notification.title }}</h5>
+                                <small>{{ notification.created_at[:16] }}</small>
+                            </div>
+                            <p class="mb-1">{{ notification.message }}</p>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% else %}
+                    <div class="alert alert-info">У вас нет уведомлений</div>
+                    {% endif %}
+                </div>
+            </body>
+            </html>
+        ''',
+        'search.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Поиск - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/post/create">Создать пост</a>
+                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <h2>Поиск мероприятий</h2>
+                    
+                    <form method="GET" class="mb-4">
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <input type="text" class="form-control" name="q" placeholder="Поиск..." value="{{ search_query }}">
+                            </div>
+                            <div class="col-md-3">
+                                <select class="form-select" name="category">
+                                    <option value="">Все категории</option>
+                                    {% for category in categories %}
+                                    <option value="{{ category.name }}" {% if request.args.get('category') == category.name %}selected{% endif %}>{{ category.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <input type="text" class="form-control" name="location" placeholder="Местоположение" value="{{ request.args.get('location', '') }}">
+                            </div>
+                            <div class="col-md-2">
+                                <button type="submit" class="btn btn-primary w-100">Найти</button>
+                            </div>
+                        </div>
+                    </form>
+                    
+                    {% if posts %}
+                    <h4>Найдено мероприятий: {{ posts|length }}</h4>
+                    {% for post in posts %}
+                    <div class="card mb-3">
+                        <div class="card-body">
+                            <h5 class="card-title">{{ post.title }}</h5>
+                            <h6 class="card-subtitle mb-2 text-muted">Автор: {{ post.full_name or post.username }}</h6>
+                            <p class="card-text">{{ post.content[:200] }}{% if post.content|length > 200 %}...{% endif %}</p>
+                            {% if post.location %}<p class="card-text"><small>Место: {{ post.location }}</small></p>{% endif %}
+                            <div class="btn-group">
+                                <a href="/post/{{ post.id }}" class="btn btn-outline-primary btn-sm">Подробнее</a>
+                                <a href="/chat/{{ post.user_id }}" class="btn btn-outline-success btn-sm">Написать автору</a>
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                    {% elif request.args %}
+                    <div class="alert alert-info">По вашему запросу ничего не найдено</div>
+                    {% endif %}
+                </div>
+            </body>
+            </html>
+        ''',
+        'calendar.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Календарь - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/fullcalendar@5.10.1/main.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/post/create">Создать пост</a>
+                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <h2>Календарь мероприятий</h2>
+                    <div id="calendar"></div>
+                </div>
+                
+                <script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.10.1/main.min.js"></script>
+                <script>
+                    document.addEventListener('DOMContentLoaded', function() {
+                        var calendarEl = document.getElementById('calendar');
+                        var calendar = new FullCalendar.Calendar(calendarEl, {
+                            initialView: 'dayGridMonth',
+                            events: '/api/events',
+                            eventClick: function(info) {
+                                info.jsEvent.preventDefault();
+                                if (info.event.url) {
+                                    window.open(info.event.url, '_self');
+                                }
+                            }
+                        });
+                        calendar.render();
+                    });
+                </script>
+            </body>
+            </html>
+        ''',
+        'stats.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Статистика - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/post/create">Создать пост</a>
+                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <h2>Статистика платформы</h2>
+                    
+                    <div class="row mt-4">
+                        <div class="col-md-3">
+                            <div class="card text-white bg-primary">
+                                <div class="card-body text-center">
+                                    <h3>{{ total_posts }}</h3>
+                                    <p>Всего мероприятий</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card text-white bg-success">
+                                <div class="card-body text-center">
+                                    <h3>{{ total_users }}</h3>
+                                    <p>Зарегистрированных пользователей</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card text-white bg-warning">
+                                <div class="card-body text-center">
+                                    <h3>{{ total_volunteers }}</h3>
+                                    <p>Активных волонтеров</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card text-white bg-info">
+                                <div class="card-body text-center">
+                                    <h3>{{ user_posts_count + user_forms_count }}</h3>
+                                    <p>Ваша активность</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row mt-4">
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Статистика по категориям</h5>
+                                </div>
+                                <div class="card-body">
+                                    {% if categories_stats %}
+                                    <ul class="list-group">
+                                        {% for stat in categories_stats %}
+                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                            {{ stat.name }}
+                                            <span class="badge bg-primary rounded-pill">{{ stat.post_count }}</span>
+                                        </li>
+                                        {% endfor %}
+                                    </ul>
+                                    {% else %}
+                                    <p class="text-muted">Нет данных</p>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Ваша статистика</h5>
+                                </div>
+                                <div class="card-body">
+                                    <ul class="list-group">
+                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                            Созданные посты
+                                            <span class="badge bg-primary rounded-pill">{{ user_posts_count }}</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                            Поданые заявки
+                                            <span class="badge bg-success rounded-pill">{{ user_forms_count }}</span>
+                                        </li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-4">
+                        <form action="/admin/backup" method="POST">
+                            <button type="submit" class="btn btn-outline-primary">Создать резервную копию</button>
+                        </form>
                     </div>
                 </div>
             </body>
@@ -1229,13 +2173,12 @@ def render_template(template_name, **context):
     
     template = templates.get(template_name)
     if template:
-        from flask import render_template_string
         return render_template_string(template, **context)
     return f"Template {template_name} not found", 404
 
 if __name__ == '__main__':
     with app.app_context():
         init_db()
-        upgrade_db()  # <-- Добавьте эту строку
+        upgrade_db()
     debug_mode = os.environ.get('FLASK_ENV') != 'production'
     app.run(host='0.0.0.0', port=5000, debug=debug_mode)
