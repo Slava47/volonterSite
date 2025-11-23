@@ -69,6 +69,24 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def moderator_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session or session.get('role') != 'moderator':
+            flash('Доступ только для модераторов')
+            return redirect(url_for('feed'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def organizer_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session or session.get('role') not in ['organizer', 'moderator']:
+            flash('Только организаторы могут создавать мероприятия')
+            return redirect(url_for('feed'))
+        return f(*args, **kwargs)
+    return decorated_function
+
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
@@ -102,6 +120,11 @@ def init_db():
                 full_name TEXT,
                 bio TEXT,
                 skills TEXT,
+                role TEXT DEFAULT 'volunteer',
+                organization_name TEXT,
+                organization_description TEXT,
+                organization_contact TEXT,
+                is_visible BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -202,6 +225,8 @@ def init_db():
                 post_id INTEGER,
                 rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
                 comment TEXT,
+                is_reported BOOLEAN DEFAULT FALSE,
+                report_reason TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (from_user_id) REFERENCES users (id),
                 FOREIGN KEY (to_user_id) REFERENCES users (id),
@@ -228,6 +253,22 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users (id),
                 FOREIGN KEY (achievement_id) REFERENCES achievements (id),
                 PRIMARY KEY (user_id, achievement_id)
+            )
+        ''')
+        # Таблица жалоб
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id INTEGER NOT NULL,
+                reported_rating_id INTEGER,
+                reported_post_id INTEGER,
+                report_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (reporter_id) REFERENCES users (id),
+                FOREIGN KEY (reported_rating_id) REFERENCES ratings (id),
+                FOREIGN KEY (reported_post_id) REFERENCES posts (id)
             )
         ''')
         
@@ -264,22 +305,30 @@ def init_db():
             except sqlite3.IntegrityError:
                 pass
         
+        # Создаем аккаунты модераторов
+        moderators = [
+            ('moderator1', 'moderator1@example.com', 'Moderator123!', 'Алексей Модераторов', 'moderator'),
+            ('moderator2', 'moderator2@example.com', 'Moderator123!', 'Мария Модераторова', 'moderator'),
+            ('moderator3', 'moderator3@example.com', 'Moderator123!', 'Иван Модераторов', 'moderator'),
+            ('moderator4', 'moderator4@example.com', 'Moderator123!', 'Елена Модераторова', 'moderator'),
+            ('moderator5', 'moderator5@example.com', 'Moderator123!', 'Дмитрий Модераторов', 'moderator')
+        ]
+        
+        for mod in moderators:
+            try:
+                db.execute(
+                    "INSERT INTO users (username, email, password, full_name, role, is_visible) VALUES (?, ?, ?, ?, ?, ?)",
+                    (mod[0], mod[1], generate_password_hash(mod[2]), mod[3], mod[4], False)
+                )
+            except sqlite3.IntegrityError:
+                pass
+        
         db.commit()
 
 def upgrade_db():
     """Добавляет недостающие колонки в существующую БД"""
     with app.app_context():
         db = get_db()
-        
-        # Проверяем и добавляем колонку needs_volunteers если её нет
-        try:
-            db.execute('SELECT needs_volunteers FROM posts LIMIT 1')
-            print("✅ Колонка needs_volunteers уже существует")
-        except sqlite3.OperationalError:
-            print("🔄 Добавляем колонку needs_volunteers в таблицу posts...")
-            db.execute('ALTER TABLE posts ADD COLUMN needs_volunteers BOOLEAN DEFAULT FALSE')
-            db.commit()
-            print("✅ Колонка needs_volunteers добавлена")
         
         # Проверяем существование таблицы volunteer_forms
         try:
@@ -364,7 +413,7 @@ def get_user_rating(user_id):
     result = db.execute('''
         SELECT AVG(rating) as avg_rating, COUNT(*) as rating_count 
         FROM ratings 
-        WHERE to_user_id = ?
+        WHERE to_user_id = ? AND is_reported = FALSE
     ''', (user_id,)).fetchone()
     return result
 
@@ -432,6 +481,7 @@ def register():
         email = request.form['email']
         password = request.form['password']
         full_name = request.form['full_name']
+        role = request.form['role']
         
         db = get_db()
         error = None
@@ -446,10 +496,20 @@ def register():
         
         if error is None:
             try:
-                db.execute(
-                    "INSERT INTO users (username, email, password, full_name) VALUES (?, ?, ?, ?)",
-                    (username, email, generate_password_hash(password), full_name)
-                )
+                if role == 'organizer':
+                    organization_name = request.form['organization_name']
+                    organization_description = request.form['organization_description']
+                    organization_contact = request.form['organization_contact']
+                    
+                    db.execute(
+                        "INSERT INTO users (username, email, password, full_name, role, organization_name, organization_description, organization_contact) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (username, email, generate_password_hash(password), full_name, role, organization_name, organization_description, organization_contact)
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO users (username, email, password, full_name, role) VALUES (?, ?, ?, ?, ?)",
+                        (username, email, generate_password_hash(password), full_name, role)
+                    )
                 db.commit()
                 flash('Регистрация успешна! Теперь войдите в систему')
                 return redirect(url_for('login'))
@@ -479,7 +539,13 @@ def login():
             session.clear()
             session['user_id'] = user['id']
             session['username'] = user['username']
-            flash(f'Добро пожаловать, {user["full_name"] or user["username"]}!')
+            session['role'] = user['role']
+            session['full_name'] = user['full_name']
+            
+            if user['role'] == 'moderator':
+                flash(f'Добро пожаловать, модератор {user["full_name"]}!')
+            else:
+                flash(f'Добро пожаловать, {user["full_name"] or user["username"]}!')
             return redirect(url_for('feed'))
         
         flash(error)
@@ -497,7 +563,11 @@ def logout():
 def profile():
     db = get_db()
     user = db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
-    user_posts = db.execute('SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC', (session['user_id'],)).fetchall()
+    
+    if session['role'] in ['organizer', 'moderator']:
+        user_posts = db.execute('SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC', (session['user_id'],)).fetchall()
+    else:
+        user_posts = []
     
     # Получаем анкеты пользователя
     user_forms = db.execute('''
@@ -512,11 +582,21 @@ def profile():
     # Получаем рейтинг пользователя
     user_rating = get_user_rating(session['user_id'])
     
+    # Получаем отзывы о пользователе
+    user_reviews = db.execute('''
+        SELECT r.*, u.username as reviewer_username, u.full_name as reviewer_name, p.title as post_title
+        FROM ratings r
+        JOIN users u ON r.from_user_id = u.id
+        LEFT JOIN posts p ON r.post_id = p.id
+        WHERE r.to_user_id = ? AND r.is_reported = FALSE
+        ORDER BY r.created_at DESC
+    ''', (session['user_id'],)).fetchall()
+    
     # Получаем достижения
     user_achievements = check_achievements(session['user_id'])
     
     return render_template('profile.html', user=user, posts=user_posts, forms=user_forms, 
-                         user_rating=user_rating, achievements=user_achievements)
+                         user_rating=user_rating, achievements=user_achievements, reviews=user_reviews)
 
 @app.route('/profile/edit', methods=['GET', 'POST'])
 @login_required
@@ -530,11 +610,22 @@ def edit_profile():
         bio = request.form['bio']
         skills = request.form['skills']
         
+        if session['role'] == 'organizer':
+            organization_name = request.form['organization_name']
+            organization_description = request.form['organization_description']
+            organization_contact = request.form['organization_contact']
+        
         try:
-            db.execute(
-                'UPDATE users SET full_name = ?, email = ?, bio = ?, skills = ? WHERE id = ?',
-                (full_name, email, bio, skills, session['user_id'])
-            )
+            if session['role'] == 'organizer':
+                db.execute(
+                    'UPDATE users SET full_name = ?, email = ?, bio = ?, skills = ?, organization_name = ?, organization_description = ?, organization_contact = ? WHERE id = ?',
+                    (full_name, email, bio, skills, organization_name, organization_description, organization_contact, session['user_id'])
+                )
+            else:
+                db.execute(
+                    'UPDATE users SET full_name = ?, email = ?, bio = ?, skills = ? WHERE id = ?',
+                    (full_name, email, bio, skills, session['user_id'])
+                )
             db.commit()
             flash('Профиль успешно обновлен!')
             return redirect(url_for('profile'))
@@ -568,6 +659,7 @@ def feed():
 
 @app.route('/post/create', methods=['GET', 'POST'])
 @login_required
+@organizer_required
 def create_post():
     db = get_db()
     categories = db.execute('SELECT * FROM categories').fetchall()
@@ -638,7 +730,7 @@ def post_detail(post_id):
     
     # Для автора поста - показываем список анкет
     volunteer_forms = None
-    if post['user_id'] == session['user_id']:
+    if post['user_id'] == session['user_id'] or session['role'] == 'moderator':
         volunteer_forms = db.execute('''
             SELECT vf.*, u.username, u.full_name 
             FROM volunteer_forms vf 
@@ -740,8 +832,8 @@ def update_form_status(form_id):
         flash('Анкета не найдена')
         return redirect(url_for('profile'))
     
-    # Проверяем, что текущий пользователь - автор поста
-    if form['post_author_id'] != session['user_id']:
+    # Проверяем, что текущий пользователь - автор поста или модератор
+    if form['post_author_id'] != session['user_id'] and session['role'] != 'moderator':
         flash('У вас нет прав для изменения этой анкеты')
         return redirect(url_for('profile'))
     
@@ -788,7 +880,13 @@ def update_form_status(form_id):
 @login_required
 def delete_post(post_id):
     db = get_db()
-    post = db.execute('SELECT * FROM posts WHERE id = ? AND user_id = ?', (post_id, session['user_id'])).fetchone()
+    
+    if session['role'] == 'moderator':
+        # Модератор может удалить любой пост
+        post = db.execute('SELECT * FROM posts WHERE id = ?', (post_id,)).fetchone()
+    else:
+        # Обычный пользователь может удалить только свой пост
+        post = db.execute('SELECT * FROM posts WHERE id = ? AND user_id = ?', (post_id, session['user_id'])).fetchone()
     
     if post is None:
         flash('Вы не можете удалить этот пост')
@@ -902,13 +1000,23 @@ def get_messages(chat_id):
 @app.route('/users')
 @login_required
 def users_list():
+    search_query = request.args.get('q', '')
     db = get_db()
-    users = db.execute('''
-        SELECT id, username, full_name, bio, skills 
-        FROM users 
-        WHERE id != ? 
-        ORDER BY username
-    ''', (session['user_id'],)).fetchall()
+    
+    if search_query:
+        users = db.execute('''
+            SELECT id, username, full_name, bio, skills, role, organization_name
+            FROM users 
+            WHERE id != ? AND is_visible = TRUE AND (username LIKE ? OR full_name LIKE ? OR bio LIKE ? OR skills LIKE ?)
+            ORDER BY username
+        ''', (session['user_id'], f'%{search_query}%', f'%{search_query}%', f'%{search_query}%', f'%{search_query}%')).fetchall()
+    else:
+        users = db.execute('''
+            SELECT id, username, full_name, bio, skills, role, organization_name
+            FROM users 
+            WHERE id != ? AND is_visible = TRUE
+            ORDER BY username
+        ''', (session['user_id'],)).fetchall()
     
     # Добавляем рейтинги для пользователей
     users_with_ratings = []
@@ -920,10 +1028,12 @@ def users_list():
             'full_name': user['full_name'],
             'bio': user['bio'],
             'skills': user['skills'],
+            'role': user['role'],
+            'organization_name': user['organization_name'],
             'rating': rating
         })
     
-    return render_template('users_list.html', users=users_with_ratings)
+    return render_template('users_list.html', users=users_with_ratings, search_query=search_query)
 
 @app.route('/user/<int:user_id>/rate', methods=['POST'])
 @login_required
@@ -948,6 +1058,47 @@ def rate_user(user_id):
     except sqlite3.IntegrityError:
         flash('Вы уже оставляли отзыв этому пользователю')
     
+    return redirect(request.referrer or url_for('profile'))
+
+@app.route('/rating/<int:rating_id>/report', methods=['POST'])
+@login_required
+def report_rating(rating_id):
+    reason = request.form.get('reason', '')
+    
+    if not reason:
+        flash('Укажите причину жалобы')
+        return redirect(request.referrer or url_for('profile'))
+    
+    db = get_db()
+    
+    # Проверяем существование отзыва
+    rating = db.execute('SELECT * FROM ratings WHERE id = ?', (rating_id,)).fetchone()
+    if not rating:
+        flash('Отзыв не найден')
+        return redirect(request.referrer or url_for('profile'))
+    
+    # Создаем жалобу
+    db.execute(
+        'INSERT INTO reports (reporter_id, reported_rating_id, report_type, reason) VALUES (?, ?, ?, ?)',
+        (session['user_id'], rating_id, 'rating', reason)
+    )
+    
+    # Помечаем отзыв как спорный
+    db.execute(
+        'UPDATE ratings SET is_reported = TRUE WHERE id = ?',
+        (rating_id,)
+    )
+    
+    db.commit()
+    
+    # Уведомляем модераторов
+    moderators = db.execute('SELECT id FROM users WHERE role = "moderator"').fetchall()
+    for mod in moderators:
+        create_notification(mod['id'], 
+                          'Новая жалоба на отзыв', 
+                          f'Пользователь {session["username"]} пожаловался на отзыв. Причина: {reason}')
+    
+    flash('Жалоба отправлена модераторам')
     return redirect(request.referrer or url_for('profile'))
 
 # Новые маршруты для дополнительного функционала
@@ -1062,15 +1213,19 @@ def api_events():
     
     return jsonify(events_list)
 
+# СЕРВИСНЫЕ ФУНКЦИИ - ТОЛЬКО ДЛЯ МОДЕРАТОРОВ
+
 @app.route('/stats')
-@login_required
+@moderator_required
 def stats():
     db = get_db()
     
     # Общая статистика
     total_posts = db.execute('SELECT COUNT(*) FROM posts').fetchone()[0]
-    total_users = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    total_users = db.execute('SELECT COUNT(*) FROM users WHERE is_visible = TRUE').fetchone()[0]
     total_volunteers = db.execute('SELECT COUNT(DISTINCT user_id) FROM volunteer_forms').fetchone()[0]
+    total_moderators = db.execute('SELECT COUNT(*) FROM users WHERE role = "moderator"').fetchone()[0]
+    total_organizers = db.execute('SELECT COUNT(*) FROM users WHERE role = "organizer"').fetchone()[0]
     
     # Статистика по категориям
     categories_stats = db.execute('''
@@ -1081,19 +1236,39 @@ def stats():
         ORDER BY post_count DESC
     ''').fetchall()
     
-    # Активность пользователя
-    user_posts_count = db.execute('SELECT COUNT(*) FROM posts WHERE user_id = ?', 
-                                (session['user_id'],)).fetchone()[0]
-    user_forms_count = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE user_id = ?', 
-                                (session['user_id'],)).fetchone()[0]
+    # Статистика по активностям
+    active_posts_last_week = db.execute('''
+        SELECT COUNT(*) FROM posts 
+        WHERE created_at >= datetime('now', '-7 days')
+    ''').fetchone()[0]
+    
+    active_users_last_week = db.execute('''
+        SELECT COUNT(DISTINCT user_id) FROM (
+            SELECT user_id FROM posts WHERE created_at >= datetime('now', '-7 days')
+            UNION 
+            SELECT user_id FROM volunteer_forms WHERE created_at >= datetime('now', '-7 days')
+            UNION
+            SELECT sender_id as user_id FROM messages WHERE created_at >= datetime('now', '-7 days')
+        )
+    ''').fetchone()[0]
+    
+    # Статистика по заявкам
+    pending_forms = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE status = "pending"').fetchone()[0]
+    approved_forms = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE status = "approved"').fetchone()[0]
+    rejected_forms = db.execute('SELECT COUNT(*) FROM volunteer_forms WHERE status = "rejected"').fetchone()[0]
     
     return render_template('stats.html',
                          total_posts=total_posts,
                          total_users=total_users,
                          total_volunteers=total_volunteers,
+                         total_moderators=total_moderators,
+                         total_organizers=total_organizers,
                          categories_stats=categories_stats,
-                         user_posts_count=user_posts_count,
-                         user_forms_count=user_forms_count)
+                         active_posts_last_week=active_posts_last_week,
+                         active_users_last_week=active_users_last_week,
+                         pending_forms=pending_forms,
+                         approved_forms=approved_forms,
+                         rejected_forms=rejected_forms)
 
 @app.route('/export/my_data')
 @login_required
@@ -1121,13 +1296,46 @@ def export_my_data():
     return jsonify(user_data)
 
 @app.route('/admin/backup', methods=['POST'])
-@login_required
+@moderator_required
 def backup_database():
-    """Создание резервной копии базы данных"""
-    backup_path = f"/app/data/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    shutil.copy2(app.config['DATABASE'], backup_path)
-    flash(f'Резервная копия создана: {backup_path}')
-    return redirect(url_for('profile'))
+    """Создание резервной копии базы данных - только для модераторов"""
+    try:
+        backup_path = f"/app/data/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy2(app.config['DATABASE'], backup_path)
+        
+        # Получаем список всех бэкапов
+        backup_files = [f for f in os.listdir('/app/data') if f.startswith('backup_') and f.endswith('.db')]
+        backup_files.sort(reverse=True)
+        
+        # Удаляем старые бэкапы (оставляем только последние 10)
+        if len(backup_files) > 10:
+            for old_backup in backup_files[10:]:
+                os.remove(f"/app/data/{old_backup}")
+        
+        flash(f'Резервная копия создана: {backup_path}')
+    except Exception as e:
+        flash(f'Ошибка при создании резервной копии: {str(e)}')
+    
+    return redirect(url_for('moderator_panel'))
+
+@app.route('/admin/backups')
+@moderator_required
+def list_backups():
+    """Список резервных копий - только для модераторов"""
+    backup_files = []
+    if os.path.exists('/app/data'):
+        for f in os.listdir('/app/data'):
+            if f.startswith('backup_') and f.endswith('.db'):
+                file_path = f"/app/data/{f}"
+                stat = os.stat(file_path)
+                backup_files.append({
+                    'name': f,
+                    'size': stat.st_size,
+                    'created': datetime.fromtimestamp(stat.st_ctime)
+                })
+    
+    backup_files.sort(key=lambda x: x['created'], reverse=True)
+    return render_template('backups.html', backups=backup_files)
 
 @app.route('/health')
 def health_check():
@@ -1135,9 +1343,111 @@ def health_check():
     try:
         db = get_db()
         db.execute('SELECT 1')
-        return jsonify({'status': 'healthy', 'database': 'connected'})
+        
+        # Проверяем доступность директории данных
+        if not os.path.exists('/app/data'):
+            return jsonify({'status': 'unhealthy', 'error': 'Data directory not found'}), 500
+            
+        return jsonify({
+            'status': 'healthy', 
+            'database': 'connected',
+            'timestamp': datetime.now().isoformat()
+        })
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+
+# Модераторские функции
+@app.route('/moderator')
+@moderator_required
+def moderator_panel():
+    db = get_db()
+    
+    # Получаем жалобы
+    reports = db.execute('''
+        SELECT r.*, 
+               u1.username as reporter_username,
+               u2.username as reported_username,
+               p.title as post_title,
+               rat.comment as rating_comment
+        FROM reports r
+        LEFT JOIN users u1 ON r.reporter_id = u1.id
+        LEFT JOIN users u2 ON r.reported_rating_id IN (SELECT id FROM ratings WHERE to_user_id = u2.id)
+        LEFT JOIN posts p ON r.reported_post_id = p.id
+        LEFT JOIN ratings rat ON r.reported_rating_id = rat.id
+        WHERE r.status = 'pending'
+        ORDER BY r.created_at DESC
+    ''').fetchall()
+    
+    # Получаем все посты для возможности удаления
+    all_posts = db.execute('''
+        SELECT p.*, u.username, u.full_name 
+        FROM posts p 
+        JOIN users u ON p.user_id = u.id 
+        ORDER BY p.created_at DESC
+    ''').fetchall()
+    
+    # Получаем все отзывы для возможности удаления
+    all_ratings = db.execute('''
+        SELECT r.*, u1.username as from_username, u2.username as to_username, p.title as post_title
+        FROM ratings r
+        JOIN users u1 ON r.from_user_id = u1.id
+        JOIN users u2 ON r.to_user_id = u2.id
+        LEFT JOIN posts p ON r.post_id = p.id
+        ORDER BY r.created_at DESC
+    ''').fetchall()
+    
+    return render_template('moderator_panel.html', 
+                         reports=reports, 
+                         posts=all_posts, 
+                         ratings=all_ratings)
+
+@app.route('/moderator/report/<int:report_id>/resolve', methods=['POST'])
+@moderator_required
+def resolve_report(report_id):
+    action = request.form.get('action')
+    db = get_db()
+    
+    report = db.execute('SELECT * FROM reports WHERE id = ?', (report_id,)).fetchone()
+    if not report:
+        flash('Жалоба не найдена')
+        return redirect(url_for('moderator_panel'))
+    
+    if action == 'delete_rating' and report['reported_rating_id']:
+        # Удаляем отзыв
+        db.execute('DELETE FROM ratings WHERE id = ?', (report['reported_rating_id'],))
+        flash('Отзыв удален')
+    elif action == 'keep_rating' and report['reported_rating_id']:
+        # Оставляем отзыв, снимаем отметку о жалобе
+        db.execute('UPDATE ratings SET is_reported = FALSE WHERE id = ?', (report['reported_rating_id'],))
+        flash('Отзыв оставлен')
+    elif action == 'delete_post' and report['reported_post_id']:
+        # Удаляем пост
+        db.execute('DELETE FROM posts WHERE id = ?', (report['reported_post_id'],))
+        flash('Пост удален')
+    
+    # Помечаем жалобу как решенную
+    db.execute('UPDATE reports SET status = "resolved" WHERE id = ?', (report_id,))
+    db.commit()
+    
+    return redirect(url_for('moderator_panel'))
+
+@app.route('/moderator/rating/<int:rating_id>/delete', methods=['POST'])
+@moderator_required
+def moderator_delete_rating(rating_id):
+    db = get_db()
+    db.execute('DELETE FROM ratings WHERE id = ?', (rating_id,))
+    db.commit()
+    flash('Отзыв удален')
+    return redirect(url_for('moderator_panel'))
+
+@app.route('/moderator/post/<int:post_id>/delete', methods=['POST'])
+@moderator_required
+def moderator_delete_post(post_id):
+    db = get_db()
+    db.execute('DELETE FROM posts WHERE id = ?', (post_id,))
+    db.commit()
+    flash('Пост удален')
+    return redirect(url_for('moderator_panel'))
 
 # Шаблоны
 def render_template(template_name, **context):
@@ -1217,15 +1527,40 @@ def render_template(template_name, **context):
             <body class="bg-light">
                 <div class="container mt-5">
                     <div class="row justify-content-center">
-                        <div class="col-md-6">
+                        <div class="col-md-8">
                             <div class="card">
                                 <div class="card-body">
                                     <h2 class="card-title text-center">Регистрация</h2>
                                     {% with messages = get_flashed_messages() %}{% if messages %}{% for message in messages %}<div class="alert alert-danger">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}
-                                    <form method="POST">
+                                    <form method="POST" id="registerForm">
+                                        <div class="mb-3">
+                                            <label class="form-label">Тип аккаунта *</label>
+                                            <select class="form-select" name="role" id="roleSelect" required>
+                                                <option value="">Выберите тип аккаунта</option>
+                                                <option value="volunteer">Волонтер</option>
+                                                <option value="organizer">Организатор</option>
+                                            </select>
+                                        </div>
                                         <div class="mb-3"><label class="form-label">Имя пользователя *</label><input type="text" class="form-control" name="username" required></div>
                                         <div class="mb-3"><label class="form-label">Email *</label><input type="email" class="form-control" name="email" required></div>
                                         <div class="mb-3"><label class="form-label">Полное имя</label><input type="text" class="form-control" name="full_name"></div>
+                                        
+                                        <!-- Поля для организатора -->
+                                        <div id="organizerFields" style="display: none;">
+                                            <div class="mb-3">
+                                                <label class="form-label">Название организации *</label>
+                                                <input type="text" class="form-control" name="organization_name">
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label">Описание организации</label>
+                                                <textarea class="form-control" name="organization_description" rows="3"></textarea>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label">Контакты организации *</label>
+                                                <input type="text" class="form-control" name="organization_contact" placeholder="Телефон, email или сайт">
+                                            </div>
+                                        </div>
+                                        
                                         <div class="mb-3"><label class="form-label">Пароль *</label><input type="password" class="form-control" name="password" required>
                                         <div class="form-text">Пароль должен содержать минимум 8 символов, заглавные и строчные буквы, цифры</div></div>
                                         <button type="submit" class="btn btn-primary w-100">Зарегистрироваться</button>
@@ -1236,6 +1571,24 @@ def render_template(template_name, **context):
                         </div>
                     </div>
                 </div>
+                <script>
+                    document.getElementById('roleSelect').addEventListener('change', function() {
+                        var organizerFields = document.getElementById('organizerFields');
+                        if (this.value === 'organizer') {
+                            organizerFields.style.display = 'block';
+                            // Делаем поля обязательными
+                            organizerFields.querySelectorAll('input, textarea').forEach(function(field) {
+                                field.required = true;
+                            });
+                        } else {
+                            organizerFields.style.display = 'none';
+                            // Убираем обязательность
+                            organizerFields.querySelectorAll('input, textarea').forEach(function(field) {
+                                field.required = false;
+                            });
+                        }
+                    });
+                </script>
             </body>
             </html>
         ''',
@@ -1257,6 +1610,16 @@ def render_template(template_name, **context):
                                         <button type="submit" class="btn btn-primary w-100">Войти</button>
                                     </form>
                                     <div class="text-center mt-3"><a href="/register">Нет аккаунта? Зарегистрируйтесь</a></div>
+                                    <div class="mt-4">
+                                        <h6>Аккаунты модераторов для тестирования:</h6>
+                                        <small class="text-muted">
+                                            moderator1 / Moderator123!<br>
+                                            moderator2 / Moderator123!<br>
+                                            moderator3 / Moderator123!<br>
+                                            moderator4 / Moderator123!<br>
+                                            moderator5 / Moderator123!
+                                        </small>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -1274,7 +1637,9 @@ def render_template(template_name, **context):
                     <div class="container">
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
+                            {% if session.role in ['organizer', 'moderator'] %}
                             <a class="nav-link" href="/post/create">Создать пост</a>
+                            {% endif %}
                             <a class="nav-link" href="/search">Поиск</a>
                             <a class="nav-link" href="/calendar">Календарь</a>
                             <a class="nav-link" href="/chats">Мои чаты</a>
@@ -1283,6 +1648,10 @@ def render_template(template_name, **context):
                                 <span id="notificationBadge" class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" style="display: none;">0</span>
                             </a>
                             <a class="nav-link" href="/users">Все пользователи</a>
+                            {% if session.role == 'moderator' %}
+                            <a class="nav-link" href="/moderator">Панель модератора</a>
+                            <a class="nav-link" href="/stats">Статистика</a>
+                            {% endif %}
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
                         </div>
@@ -1310,7 +1679,7 @@ def render_template(template_name, **context):
                             
                             <div class="btn-group">
                                 <a href="/post/{{ post.id }}" class="btn btn-outline-primary btn-sm">Подробнее</a>
-                                {% if post.user_id == session['user_id'] %}
+                                {% if post.user_id == session['user_id'] or session.role == 'moderator' %}
                                 <form action="/post/{{ post.id }}/delete" method="POST" class="d-inline">
                                     <button type="submit" class="btn btn-outline-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить</button>
                                 </form>
@@ -1433,7 +1802,7 @@ def render_template(template_name, **context):
                     </div>
 
                     {% if post.needs_volunteers %}
-                        {% if post.user_id != session['user_id'] %}
+                        {% if post.user_id != session['user_id'] and session.role != 'moderator' %}
                             {% if not existing_form %}
                                 <div class="card mb-4">
                                     <div class="card-body text-center">
@@ -1454,7 +1823,7 @@ def render_template(template_name, **context):
                                 </div>
                             {% endif %}
                         {% else %}
-                            <!-- Для автора поста - показываем список заявок -->
+                            <!-- Для автора поста или модератора - показываем список заявок -->
                             <div class="card">
                                 <div class="card-header">
                                     <h5 class="card-title mb-0">📋 Заявки волонтеров</h5>
@@ -1479,10 +1848,12 @@ def render_template(template_name, **context):
                                                         {% else %}{{ form.status }}{% endif %}
                                                     </span>
                                                     <div>
+                                                        {% if post.user_id == session['user_id'] or session.role == 'moderator' %}
                                                         <form action="/volunteer_form/{{ form.id }}/update_status" method="POST" class="d-inline">
                                                             <button type="submit" name="status" value="approved" class="btn btn-success btn-sm">Одобрить</button>
                                                             <button type="submit" name="status" value="rejected" class="btn btn-danger btn-sm">Отклонить</button>
                                                         </form>
+                                                        {% endif %}
                                                         <a href="/chat/{{ form.user_id }}" class="btn btn-primary btn-sm">Написать</a>
                                                     </div>
                                                 </div>
@@ -1535,7 +1906,7 @@ def render_template(template_name, **context):
                                         <div class="mb-3">
                                             <label class="form-label">Полное имя *</label>
                                             <input type="text" class="form-control" name="full_name" required 
-                                                   value="{{ session.get('user_full_name', '') }}">
+                                                   value="{{ session.get('full_name', '') }}">
                                         </div>
                                         
                                         <div class="mb-3">
@@ -1597,9 +1968,13 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/feed">Лента</a>
+                            {% if session.role in ['organizer', 'moderator'] %}
                             <a class="nav-link" href="/post/create">Создать пост</a>
+                            {% endif %}
                             <a class="nav-link" href="/chats">Мои чаты</a>
+                            {% if session.role == 'moderator' %}
                             <a class="nav-link" href="/stats">Статистика</a>
+                            {% endif %}
                             <a class="nav-link" href="/logout">Выйти</a>
                         </div>
                     </div>
@@ -1612,6 +1987,18 @@ def render_template(template_name, **context):
                                 <div class="card-body">
                                     <h3 class="card-title">{{ user.full_name or user.username }}</h3>
                                     <p class="text-muted">@{{ user.username }}</p>
+                                    <p>
+                                        <span class="badge {% if user.role == 'volunteer' %}bg-success{% elif user.role == 'organizer' %}bg-primary{% else %}bg-warning{% endif %}">
+                                            {% if user.role == 'volunteer' %}Волонтер
+                                            {% elif user.role == 'organizer' %}Организатор
+                                            {% else %}Модератор{% endif %}
+                                        </span>
+                                    </p>
+                                    {% if user.role == 'organizer' and user.organization_name %}
+                                    <p><strong>Организация:</strong> {{ user.organization_name }}</p>
+                                    {% if user.organization_description %}<p>{{ user.organization_description }}</p>{% endif %}
+                                    {% if user.organization_contact %}<p><strong>Контакты:</strong> {{ user.organization_contact }}</p>{% endif %}
+                                    {% endif %}
                                     {% if user_rating and user_rating.avg_rating %}
                                     <div class="mb-3">
                                         <strong>Рейтинг:</strong>
@@ -1685,6 +2072,7 @@ def render_template(template_name, **context):
                         </div>
                         
                         <div class="col-md-8">
+                            {% if session.role in ['organizer', 'moderator'] %}
                             <h4>Мои посты ({{ posts|length }})</h4>
                             {% for post in posts %}
                             <div class="card mb-3">
@@ -1703,6 +2091,51 @@ def render_template(template_name, **context):
                             {% else %}
                             <div class="alert alert-info">У вас пока нет постов</div>
                             {% endfor %}
+                            {% endif %}
+                            
+                            <!-- Отзывы о пользователе -->
+                            <div class="card mt-4">
+                                <div class="card-header">
+                                    <h5 class="card-title mb-0">📝 Отзывы обо мне</h5>
+                                </div>
+                                <div class="card-body">
+                                    {% if reviews %}
+                                        {% for review in reviews %}
+                                        <div class="card mb-3">
+                                            <div class="card-body">
+                                                <div class="d-flex justify-content-between">
+                                                    <h6 class="card-title">{{ review.reviewer_name or review.reviewer_username }}</h6>
+                                                    <div class="text-warning">
+                                                        {% for i in range(5) %}
+                                                            {% if i < review.rating %}
+                                                            ★
+                                                            {% else %}
+                                                            ☆
+                                                            {% endif %}
+                                                        {% endfor %}
+                                                    </div>
+                                                </div>
+                                                {% if review.post_title %}
+                                                <p class="text-muted">К мероприятию: {{ review.post_title }}</p>
+                                                {% endif %}
+                                                {% if review.comment %}
+                                                <p class="card-text">{{ review.comment }}</p>
+                                                {% endif %}
+                                                <small class="text-muted">{{ review.created_at[:16] }}</small>
+                                                <div class="mt-2">
+                                                    <form action="/rating/{{ review.id }}/report" method="POST" class="d-inline">
+                                                        <input type="hidden" name="reason" value="Необоснованный отзыв">
+                                                        <button type="submit" class="btn btn-outline-danger btn-sm" onclick="return confirm('Пожаловаться на этот отзыв?')">Пожаловаться</button>
+                                                    </form>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        {% endfor %}
+                                    {% else %}
+                                        <p class="text-muted">Пока нет отзывов</p>
+                                    {% endif %}
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1732,6 +2165,22 @@ def render_template(template_name, **context):
                         <div class="mb-3"><label class="form-label">Email *</label><input type="email" class="form-control" name="email" value="{{ user.email }}" required></div>
                         <div class="mb-3"><label class="form-label">О себе</label><textarea class="form-control" name="bio" rows="3">{{ user.bio or '' }}</textarea></div>
                         <div class="mb-3"><label class="form-label">Навыки (через запятую)</label><input type="text" class="form-control" name="skills" value="{{ user.skills or '' }}"><div class="form-text">Например: организация мероприятий, работа с детьми, медицинская помощь</div></div>
+                        
+                        {% if user.role == 'organizer' %}
+                        <div class="mb-3">
+                            <label class="form-label">Название организации *</label>
+                            <input type="text" class="form-control" name="organization_name" value="{{ user.organization_name or '' }}" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Описание организации</label>
+                            <textarea class="form-control" name="organization_description" rows="3">{{ user.organization_description or '' }}</textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Контакты организации *</label>
+                            <input type="text" class="form-control" name="organization_contact" value="{{ user.organization_contact or '' }}" required>
+                        </div>
+                        {% endif %}
+                        
                         <button type="submit" class="btn btn-primary">Сохранить</button>
                         <a href="/profile" class="btn btn-secondary">Отмена</a>
                     </form>
@@ -1846,7 +2295,16 @@ def render_template(template_name, **context):
                 </nav>
                 <div class="container mt-4">
                     <div class="d-flex justify-content-between align-items-center mb-4">
-                        <h2>Все пользователи</h2><a href="/chats" class="btn btn-secondary">← Назад к чатам</a>
+                        <h2>Все пользователи</h2>
+                        <div>
+                            <form method="GET" class="d-inline">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" name="q" placeholder="Поиск пользователей..." value="{{ search_query }}">
+                                    <button type="submit" class="btn btn-primary">Найти</button>
+                                </div>
+                            </form>
+                            <a href="/chats" class="btn btn-secondary ms-2">← Назад к чатам</a>
+                        </div>
                     </div>
                     <div class="row">
                         {% for user in users %}
@@ -1854,9 +2312,17 @@ def render_template(template_name, **context):
                             <div class="card">
                                 <div class="card-body">
                                     <h5 class="card-title">{{ user.full_name or user.username }}</h5>
-                                    <p class="card-text"><small class="text-muted">@{{ user.username }}</small>
+                                    <p class="card-text">
+                                        <small class="text-muted">@{{ user.username }}</small>
+                                        <span class="badge {% if user.role == 'volunteer' %}bg-success{% else %}bg-primary{% endif %} ms-2">
+                                            {% if user.role == 'volunteer' %}Волонтер{% else %}Организатор{% endif %}
+                                        </span>
+                                        {% if user.organization_name %}
+                                        <br><small class="text-muted">Организация: {{ user.organization_name }}</small>
+                                        {% endif %}
+                                    </p>
                                     {% if user.rating and user.rating.avg_rating %}
-                                    <br><div class="text-warning">
+                                    <div class="text-warning mb-2">
                                         {% for i in range(5) %}
                                             {% if i < user.rating.avg_rating|round %}
                                             ★
@@ -1867,8 +2333,8 @@ def render_template(template_name, **context):
                                         ({{ user.rating.rating_count }} отзывов)
                                     </div>
                                     {% endif %}
-                                    {% if user.bio %}<br>{{ user.bio }}{% endif %}
-                                    {% if user.skills %}<br><strong>Навыки:</strong> {{ user.skills }}{% endif %}</p>
+                                    {% if user.bio %}<p class="card-text">{{ user.bio }}</p>{% endif %}
+                                    {% if user.skills %}<p class="card-text"><strong>Навыки:</strong> {{ user.skills }}</p>{% endif %}
                                     <div class="btn-group">
                                         <a href="/chat/{{ user.id }}" class="btn btn-primary btn-sm">Написать сообщение</a>
                                         <button type="button" class="btn btn-outline-success btn-sm" data-bs-toggle="modal" data-bs-target="#rateModal{{ user.id }}">Оценить</button>
@@ -1964,7 +2430,9 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/feed">Лента</a>
+                            {% if session.role in ['organizer', 'moderator'] %}
                             <a class="nav-link" href="/post/create">Создать пост</a>
+                            {% endif %}
                             <a class="nav-link" href="/chats">Мои чаты</a>
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
@@ -2029,7 +2497,9 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/feed">Лента</a>
+                            {% if session.role in ['organizer', 'moderator'] %}
                             <a class="nav-link" href="/post/create">Создать пост</a>
+                            {% endif %}
                             <a class="nav-link" href="/chats">Мои чаты</a>
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
@@ -2071,18 +2541,17 @@ def render_template(template_name, **context):
                         <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
                         <div class="navbar-nav ms-auto">
                             <a class="nav-link" href="/feed">Лента</a>
-                            <a class="nav-link" href="/post/create">Создать пост</a>
-                            <a class="nav-link" href="/chats">Мои чаты</a>
+                            <a class="nav-link" href="/moderator">Панель модератора</a>
                             <a class="nav-link" href="/profile">Профиль</a>
                             <a class="nav-link" href="/logout">Выйти</a>
                         </div>
                     </div>
                 </nav>
                 <div class="container mt-4">
-                    <h2>Статистика платформы</h2>
+                    <h2>📊 Статистика платформы</h2>
                     
                     <div class="row mt-4">
-                        <div class="col-md-3">
+                        <div class="col-md-3 mb-3">
                             <div class="card text-white bg-primary">
                                 <div class="card-body text-center">
                                     <h3>{{ total_posts }}</h3>
@@ -2090,15 +2559,15 @@ def render_template(template_name, **context):
                                 </div>
                             </div>
                         </div>
-                        <div class="col-md-3">
+                        <div class="col-md-3 mb-3">
                             <div class="card text-white bg-success">
                                 <div class="card-body text-center">
                                     <h3>{{ total_users }}</h3>
-                                    <p>Зарегистрированных пользователей</p>
+                                    <p>Пользователей</p>
                                 </div>
                             </div>
                         </div>
-                        <div class="col-md-3">
+                        <div class="col-md-3 mb-3">
                             <div class="card text-white bg-warning">
                                 <div class="card-body text-center">
                                     <h3>{{ total_volunteers }}</h3>
@@ -2106,11 +2575,38 @@ def render_template(template_name, **context):
                                 </div>
                             </div>
                         </div>
-                        <div class="col-md-3">
+                        <div class="col-md-3 mb-3">
                             <div class="card text-white bg-info">
                                 <div class="card-body text-center">
-                                    <h3>{{ user_posts_count + user_forms_count }}</h3>
-                                    <p>Ваша активность</p>
+                                    <h3>{{ total_organizers }}</h3>
+                                    <p>Организаторов</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="row mt-4">
+                        <div class="col-md-4 mb-3">
+                            <div class="card text-white bg-secondary">
+                                <div class="card-body text-center">
+                                    <h3>{{ total_moderators }}</h3>
+                                    <p>Модераторов</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <div class="card text-white bg-dark">
+                                <div class="card-body text-center">
+                                    <h3>{{ active_posts_last_week }}</h3>
+                                    <p>Постов за неделю</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <div class="card text-white bg-danger">
+                                <div class="card-body text-center">
+                                    <h3>{{ active_users_last_week }}</h3>
+                                    <p>Активных пользователей</p>
                                 </div>
                             </div>
                         </div>
@@ -2120,7 +2616,7 @@ def render_template(template_name, **context):
                         <div class="col-md-6">
                             <div class="card">
                                 <div class="card-header">
-                                    <h5>Статистика по категориям</h5>
+                                    <h5>📈 Статистика по категориям</h5>
                                 </div>
                                 <div class="card-body">
                                     {% if categories_stats %}
@@ -2142,17 +2638,21 @@ def render_template(template_name, **context):
                         <div class="col-md-6">
                             <div class="card">
                                 <div class="card-header">
-                                    <h5>Ваша статистика</h5>
+                                    <h5>📨 Статистика заявок</h5>
                                 </div>
                                 <div class="card-body">
                                     <ul class="list-group">
                                         <li class="list-group-item d-flex justify-content-between align-items-center">
-                                            Созданные посты
-                                            <span class="badge bg-primary rounded-pill">{{ user_posts_count }}</span>
+                                            Ожидают рассмотрения
+                                            <span class="badge bg-warning rounded-pill">{{ pending_forms }}</span>
                                         </li>
                                         <li class="list-group-item d-flex justify-content-between align-items-center">
-                                            Поданые заявки
-                                            <span class="badge bg-success rounded-pill">{{ user_forms_count }}</span>
+                                            Одобренные
+                                            <span class="badge bg-success rounded-pill">{{ approved_forms }}</span>
+                                        </li>
+                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                            Отклоненные
+                                            <span class="badge bg-danger rounded-pill">{{ rejected_forms }}</span>
                                         </li>
                                     </ul>
                                 </div>
@@ -2161,11 +2661,254 @@ def render_template(template_name, **context):
                     </div>
                     
                     <div class="mt-4">
-                        <form action="/admin/backup" method="POST">
-                            <button type="submit" class="btn btn-outline-primary">Создать резервную копию</button>
-                        </form>
+                        <div class="card">
+                            <div class="card-header">
+                                <h5>🔧 Сервисные функции</h5>
+                            </div>
+                            <div class="card-body">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <form action="/admin/backup" method="POST">
+                                            <button type="submit" class="btn btn-outline-primary w-100 mb-2">
+                                                💾 Создать резервную копию
+                                            </button>
+                                        </form>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <a href="/admin/backups" class="btn btn-outline-info w-100 mb-2">
+                                            📂 Список бэкапов
+                                        </a>
+                                    </div>
+                                </div>
+                                <div class="row">
+                                    <div class="col-md-12">
+                                        <a href="/health" class="btn btn-outline-success w-100 mb-2" target="_blank">
+                                            🩺 Проверить работоспособность
+                                        </a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
+            </body>
+            </html>
+        ''',
+        'backups.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Резервные копии - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/moderator">Панель модератора</a>
+                            <a class="nav-link" href="/stats">Статистика</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h2>📂 Резервные копии базы данных</h2>
+                        <div>
+                            <form action="/admin/backup" method="POST" class="d-inline">
+                                <button type="submit" class="btn btn-primary">Создать новую копию</button>
+                            </form>
+                            <a href="/stats" class="btn btn-secondary ms-2">← Назад к статистике</a>
+                        </div>
+                    </div>
+
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}
+                            {% for message in messages %}
+                            <div class="alert alert-success">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+
+                    {% if backups %}
+                    <div class="table-responsive">
+                        <table class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th>Имя файла</th>
+                                    <th>Размер</th>
+                                    <th>Дата создания</th>
+                                    <th>Действия</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for backup in backups %}
+                                <tr>
+                                    <td>{{ backup.name }}</td>
+                                    <td>{{ "%.2f"|format(backup.size / 1024 / 1024) }} MB</td>
+                                    <td>{{ backup.created.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                                    <td>
+                                        <button class="btn btn-sm btn-outline-info" onclick="alert('Файл: {{ backup.name }}\\nРазмер: {{ "%.2f"|format(backup.size / 1024 / 1024) }} MB\\nСоздан: {{ backup.created.strftime('%Y-%m-%d %H:%M:%S') }}')">
+                                            Инфо
+                                        </button>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="alert alert-info">
+                        <strong>Информация:</strong> Хранятся только последние 10 резервных копий. Старые копии автоматически удаляются.
+                    </div>
+                    {% else %}
+                    <div class="alert alert-warning">
+                        Резервные копии не найдены. Создайте первую копию.
+                    </div>
+                    {% endif %}
+                </div>
+            </body>
+            </html>
+        ''',
+        'moderator_panel.html': '''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Панель модератора - Волонтерская Сеть</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+            <body>
+                <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+                    <div class="container">
+                        <a class="navbar-brand" href="/feed">🎗️ Волонтерская Сеть</a>
+                        <div class="navbar-nav ms-auto">
+                            <a class="nav-link" href="/feed">Лента</a>
+                            <a class="nav-link" href="/stats">Статистика</a>
+                            <a class="nav-link" href="/profile">Профиль</a>
+                            <a class="nav-link" href="/logout">Выйти</a>
+                        </div>
+                    </div>
+                </nav>
+                <div class="container mt-4">
+                    <h2>🔧 Панель модератора</h2>
+                    
+                    <ul class="nav nav-tabs" id="moderatorTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" id="reports-tab" data-bs-toggle="tab" data-bs-target="#reports" type="button" role="tab">Жалобы ({{ reports|length }})</button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="posts-tab" data-bs-toggle="tab" data-bs-target="#posts" type="button" role="tab">Все посты ({{ posts|length }})</button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="ratings-tab" data-bs-toggle="tab" data-bs-target="#ratings" type="button" role="tab">Все отзывы ({{ ratings|length }})</button>
+                        </li>
+                    </ul>
+                    
+                    <div class="tab-content mt-4" id="moderatorTabsContent">
+                        <!-- Вкладка жалоб -->
+                        <div class="tab-pane fade show active" id="reports" role="tabpanel">
+                            {% if reports %}
+                            {% for report in reports %}
+                            <div class="card mb-3">
+                                <div class="card-body">
+                                    <h5 class="card-title">
+                                        Жалоба от {{ report.reporter_username }}
+                                        <span class="badge bg-warning">На рассмотрении</span>
+                                    </h5>
+                                    <p><strong>Тип:</strong> 
+                                        {% if report.reported_rating_id %}Отзыв{% else %}Пост{% endif %}
+                                    </p>
+                                    <p><strong>Причина:</strong> {{ report.reason }}</p>
+                                    {% if report.reported_rating_id %}
+                                    <p><strong>Отзыв:</strong> {{ report.rating_comment }}</p>
+                                    <p><strong>На пользователя:</strong> {{ report.reported_username }}</p>
+                                    {% elif report.reported_post_id %}
+                                    <p><strong>Пост:</strong> {{ report.post_title }}</p>
+                                    {% endif %}
+                                    <p><small class="text-muted">Подана: {{ report.created_at[:16] }}</small></p>
+                                    
+                                    <div class="btn-group">
+                                        {% if report.reported_rating_id %}
+                                        <form action="/moderator/report/{{ report.id }}/resolve" method="POST" class="d-inline">
+                                            <button type="submit" name="action" value="delete_rating" class="btn btn-danger btn-sm" onclick="return confirm('Удалить отзыв?')">Удалить отзыв</button>
+                                            <button type="submit" name="action" value="keep_rating" class="btn btn-success btn-sm" onclick="return confirm('Оставить отзыв?')">Оставить отзыв</button>
+                                        </form>
+                                        {% elif report.reported_post_id %}
+                                        <form action="/moderator/report/{{ report.id }}/resolve" method="POST" class="d-inline">
+                                            <button type="submit" name="action" value="delete_post" class="btn btn-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить пост</button>
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                            {% else %}
+                            <div class="alert alert-info">Нет активных жалоб</div>
+                            {% endif %}
+                        </div>
+                        
+                        <!-- Вкладка постов -->
+                        <div class="tab-pane fade" id="posts" role="tabpanel">
+                            {% if posts %}
+                            {% for post in posts %}
+                            <div class="card mb-3">
+                                <div class="card-body">
+                                    <h5 class="card-title">{{ post.title }}</h5>
+                                    <h6 class="card-subtitle mb-2 text-muted">Автор: {{ post.full_name or post.username }}</h6>
+                                    <p class="card-text">{{ post.content[:200] }}{% if post.content|length > 200 %}...{% endif %}</p>
+                                    <p class="card-text"><small class="text-muted">Опубликовано: {{ post.created_at }}</small></p>
+                                    
+                                    <div class="btn-group">
+                                        <a href="/post/{{ post.id }}" class="btn btn-outline-primary btn-sm">Просмотреть</a>
+                                        <form action="/moderator/post/{{ post.id }}/delete" method="POST" class="d-inline">
+                                            <button type="submit" class="btn btn-outline-danger btn-sm" onclick="return confirm('Удалить пост?')">Удалить</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                            {% else %}
+                            <div class="alert alert-info">Нет постов</div>
+                            {% endif %}
+                        </div>
+                        
+                        <!-- Вкладка отзывов -->
+                        <div class="tab-pane fade" id="ratings" role="tabpanel">
+                            {% if ratings %}
+                            {% for rating in ratings %}
+                            <div class="card mb-3">
+                                <div class="card-body">
+                                    <div class="d-flex justify-content-between">
+                                        <h6 class="card-title">{{ rating.from_username }} → {{ rating.to_username }}</h6>
+                                        <div class="text-warning">
+                                            {% for i in range(5) %}
+                                                {% if i < rating.rating %}
+                                                ★
+                                                {% else %}
+                                                ☆
+                                                {% endif %}
+                                            {% endfor %}
+                                        </div>
+                                    </div>
+                                    {% if rating.post_title %}
+                                    <p class="text-muted">К мероприятию: {{ rating.post_title }}</p>
+                                    {% endif %}
+                                    {% if rating.comment %}
+                                    <p class="card-text">{{ rating.comment }}</p>
+                                    {% endif %}
+                                    <p class="card-text"><small class="text-muted">{{ rating.created_at[:16] }}</small></p>
+                                    
+                                    <div class="btn-group">
+                                        <form action="/moderator/rating/{{ rating.id }}/delete" method="POST" class="d-inline">
+                                            <button type="submit" class="btn btn-outline-danger btn-sm" onclick="return confirm('Удалить отзыв?')">Удалить отзыв</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                            {% else %}
+                            <div class="alert alert-info">Нет отзывов</div>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+                
+                <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
             </body>
             </html>
         '''
